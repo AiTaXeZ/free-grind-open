@@ -67,57 +67,40 @@ jobs:
             echo "project.pbxproj not found under src-tauri/gen/apple"
             exit 1
           fi
-          export PBXPROJ_PATH
-          python3 << 'PYTHON_SCRIPT'
-          import os
-          import re
-          import sys
 
-          pbxproj_path = os.environ["PBXPROJ_PATH"]
+          tmp_file="$(mktemp)"
+          if ! awk '
+            BEGIN { replaced = 0 }
+            /tauri ios xcode-script/ {
+              print "\t\t\tshellScript = \"set -e\\nLIB_PATH=\\\"$SRCROOT/Externals/arm64/release/libapp.a\\\"\\nif [ ! -f \\\"$LIB_PATH\\\" ]; then\\n  echo \\\"Missing prebuilt Rust library at $LIB_PATH\\\"\\n  exit 1\\nfi\";"
+              replaced = 1
+              next
+            }
+            { print }
+            END {
+              if (replaced == 0) {
+                exit 2
+              }
+            }
+          ' "$PBXPROJ_PATH" > "$tmp_file"; then
+            rm -f "$tmp_file"
+            echo "Failed to replace Build Rust Code script"
+            exit 1
+          fi
 
-          try:
-              with open(pbxproj_path, 'r') as f:
-                  content = f.read()
-          except Exception as e:
-              print(f"Failed to read {pbxproj_path}: {e}")
-              sys.exit(1)
+          mv "$tmp_file" "$PBXPROJ_PATH"
 
-          # First, try the original pattern
-          pattern = r'(/\* tauri ios xcode-script \*/.*?shellScript = ")[^"]*(")'
-          replacement = r'\1set -e\nLIB_PATH="$SRCROOT/Externals/arm64/release/libapp.a"\nif [ ! -f "$LIB_PATH" ]; then\n  echo "Missing prebuilt Rust library"\n  exit 1\nfi\n\2'
-          new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+          if ! grep -q -- 'Missing prebuilt Rust library' "$PBXPROJ_PATH"; then
+            echo "Failed to replace Build Rust Code script"
+            exit 1
+          fi
 
-          if new_content == content:
-              print("Primary pattern not found, trying alternative...")
-              # Look for any Build Phase with a shell script that might be the Rust build
-              # This is more flexible and catches variations in Xcode project structure
-              pattern = r'(shellScript = ")([^"]*(?:cargo|rustup|Build Rust Code)[^"]*)(")'
-              replacement = r'\1set -e\nLIB_PATH="$SRCROOT/Externals/arm64/release/libapp.a"\nif [ ! -f "$LIB_PATH" ]; then\n  echo "Missing prebuilt Rust library"\n  exit 1\nfi\n\3'
-              new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
-
-          if new_content == content:
-              print("Secondary pattern not found. Available content sections:")
-              # Debug: show what sections exist
-              sections = re.findall(r'/\*.*?\*/', content)
-              for section in sections[:10]:  # Show first 10 sections
-                  print(f"  {section}")
-              sys.exit(1)
-
-          try:
-              with open(pbxproj_path, 'w') as f:
-                  f.write(new_content)
-          except Exception as e:
-              print(f"Failed to write {pbxproj_path}: {e}")
-              sys.exit(1)
-
-          print("Successfully patched Build Rust Code script to use prebuilt libapp.a")
-          PYTHON_SCRIPT
-
-          # Validate the modified pbxproj file
           if ! plutil -lint "$PBXPROJ_PATH" >/dev/null; then
             echo "Patched project.pbxproj is invalid"
             exit 1
           fi
+
+          echo "Patched Build Rust Code script to use prebuilt libapp.a"
 
       - name: Build iOS app without code signing
         id: ios_app

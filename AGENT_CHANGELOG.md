@@ -15,3 +15,6 @@
 - Modified: `public/locales/en/translation.json`
 - Modified: `.github/workflows/build-fork.yml`
 - Modified: `.github/workflows/Build-iOS.yml`
+
+[2026-11-17 16:21] - Task: Fix Build-iOS.yml Xcode project Rust bridge script patching
+- Modified: `.github/workflows/Build-iOS.yml`
