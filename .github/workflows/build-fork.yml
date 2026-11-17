@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - development
+      - Free-Open
   workflow_dispatch:
 
 permissions:

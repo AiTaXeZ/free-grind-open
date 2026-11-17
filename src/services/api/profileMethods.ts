@@ -19,8 +19,115 @@ import { homeLocationSchema, type HomeLocation } from "../../types/home-location
 import { ApiFunctionError, assertSuccess, parseJsonSafe } from "../apiHelpers";
 import { getIncognitoMode, isRecordProfileViewsEnabled } from "../../utils/privacy";
 import { appLog } from "../../utils/logger";
+import { coarsenGeohash } from "../../utils/geohash";
+import { getThumbImageUrl, validateMediaHash } from "../../utils/media";
+
+const GET_PROFILES_CHUNK_IDS = 30;
+const SUPPORTED_CASCADE_ITEM_TYPES = new Set([
+	"full_profile_v1",
+	"partial_profile_v1",
+	"smart_boost_profile_v1",
+	"sponsored_profile_v1",
+]);
+const OPTIONAL_NON_NULL_CARD_KEYS = [
+	"isPopular",
+	"isVisiting",
+	"roaming",
+	"isBoosting",
+	"unreadCount",
+	"favorite",
+	"chatted",
+] as const;
+
+function safeCoarsenGeohash(hash: string): string {
+	try {
+		return coarsenGeohash(hash);
+	} catch {
+		return hash;
+	}
+}
+
+function extractCascadePayload(item: {
+	type: string;
+	data: unknown;
+}): Record<string, unknown> | null {
+	const raw =
+		item.type === "sponsored_profile_v1" &&
+		typeof item.data === "object" &&
+		item.data !== null &&
+		"alternativeProfile" in item.data
+			? (item.data as { alternativeProfile?: unknown }).alternativeProfile
+			: item.data;
+	if (typeof raw !== "object" || raw === null) {
+		return null;
+	}
+	return raw as Record<string, unknown>;
+}
+
+function sanitizeBrowseCardInput(raw: Record<string, unknown>): Record<string, unknown> {
+	const sanitized: Record<string, unknown> = { ...raw };
+	for (const key of OPTIONAL_NON_NULL_CARD_KEYS) {
+		if (sanitized[key] === null) {
+			delete sanitized[key];
+		}
+	}
+	return sanitized;
+}
+
+function normalizePrimaryImageUrl(
+	raw: Record<string, unknown>,
+	existingUrl?: string | null,
+): string | undefined {
+	const direct = existingUrl?.trim();
+	if (direct) {
+		return validateMediaHash(direct) ? getThumbImageUrl(direct, "320x320") : direct;
+	}
+	const profileHash =
+		typeof raw.profileImageMediaHash === "string"
+			? raw.profileImageMediaHash.trim()
+			: "";
+	if (profileHash && validateMediaHash(profileHash)) {
+		return getThumbImageUrl(profileHash, "320x320");
+	}
+	const medias = Array.isArray(raw.medias) ? raw.medias : null;
+	if (medias && medias.length > 0) {
+		const first = medias[0];
+		if (typeof first === "object" && first !== null) {
+			const mediaHash =
+				typeof (first as { mediaHash?: unknown }).mediaHash === "string"
+					? (first as { mediaHash: string }).mediaHash.trim()
+					: "";
+			if (mediaHash && validateMediaHash(mediaHash)) {
+				return getThumbImageUrl(mediaHash, "320x320");
+			}
+		}
+	}
+	return undefined;
+}
 
 export function createProfileMethods(fetchRest: RestFetcher, t: (key: string, options?: { defaultValue?: string }) => string) {
+	let lastStoredServerGeohash: string | null = null;
+
+	const syncServerLocation = async (geohash: string, force = false): Promise<void> => {
+		const coarse = safeCoarsenGeohash(geohash);
+		if (!force && coarse === lastStoredServerGeohash) {
+			return;
+		}
+		try {
+			const response = await fetchRest("/v4/location", {
+				method: "PUT",
+				body: { geohash: coarse },
+			});
+			if (response.status >= 200 && response.status < 300) {
+				lastStoredServerGeohash = coarse;
+			} else {
+				appLog.warn(`[browse] PUT /v4/location returned status ${response.status}`);
+			}
+		} catch (error) {
+			appLog.warn("[browse] PUT /v4/location sync failed", error);
+		}
+	};
+
 	return {
 		async getBlockedProfileIds(): Promise<string[]> {
 			const response = await fetchRest("/v3.1/me/blocks");
@@ -177,14 +284,26 @@ export function createProfileMethods(fetchRest: RestFetcher, t: (key: string, op
 				tags?: string;
 			};
 		}): Promise<{ cards: BrowseCard[]; nextPage: number | null }> {
+			const coarseGeohash = safeCoarsenGeohash(params.geohash);
+			const coarseExploreGeohash = params.exploreGeohash
+				? safeCoarsenGeohash(params.exploreGeohash)
+				: undefined;
+
+			if (!coarseExploreGeohash) {
+				await syncServerLocation(
+					coarseGeohash,
+					Boolean(params.filters?.favorites && !params.page),
+				);
+			}
+
 			// Cascade rejects nearbyGeoHash + exploreGeoHash together with
 			// CAS-4001 — exploring apparently relies on the server's own
 			// last-known (real) location for "nearby" once exploreGeoHash is
 			// present, so send only one or the other, never both.
 			const queryParams = new URLSearchParams(
-				params.exploreGeohash
-					? { exploreGeoHash: params.exploreGeohash }
-					: { nearbyGeoHash: params.geohash },
+				coarseExploreGeohash
+					? { exploreGeoHash: coarseExploreGeohash }
+					: { nearbyGeoHash: coarseGeohash },
 			);
 
 			if (typeof params.page === "number") {
@@ -238,16 +357,120 @@ export function createProfileMethods(fetchRest: RestFetcher, t: (key: string, op
 			const response = await fetchRest(url);
 			await assertSuccess(response, t("api.errors.load_browse_profiles"));
 			const parsed = cascadeResponseSchema.parse(await parseJsonSafe(response));
-			const cards: BrowseCard[] = [];
+			if (!coarseExploreGeohash && !params.filters?.favorites) {
+				lastStoredServerGeohash = coarseGeohash;
+			}
+			const entries: Array<{ card: BrowseCard; needsHydration: boolean }> = [];
+			const hydrateIdSet = new Set<string>();
 			for (const item of parsed.items) {
-				if (item.type !== "full_profile_v1" && item.type !== "partial_profile_v1") {
+				if (!SUPPORTED_CASCADE_ITEM_TYPES.has(item.type)) {
 					continue;
 				}
-				const candidate = browseCardSchema.safeParse(item.data);
-				if (candidate.success) {
-					cards.push(candidate.data);
+				const raw = extractCascadePayload(item);
+				if (!raw) {
+					continue;
+				}
+				const candidate = browseCardSchema.safeParse(sanitizeBrowseCardInput(raw));
+				if (!candidate.success) {
+					continue;
+				}
+				const primaryImageUrl = normalizePrimaryImageUrl(raw, candidate.data.primaryImageUrl);
+				const card: BrowseCard = {
+					...candidate.data,
+					...(primaryImageUrl ? { primaryImageUrl } : {}),
+				};
+				const needsHydration =
+					item.type === "partial_profile_v1" ||
+					(!card.primaryImageUrl && !card.displayName) ||
+					typeof raw.favorite !== "boolean" ||
+					typeof raw.chatted !== "boolean";
+				if (needsHydration) {
+					hydrateIdSet.add(card.profileId);
+				}
+				entries.push({ card, needsHydration });
+			}
+
+			// Batch-resolve partial or base-shaped cascade cards via POST /v3/profiles
+			const hydratedByProfileId = new Map<string, Record<string, unknown>>();
+			const numericIds = Array.from(hydrateIdSet)
+				.map((id) => Number(id))
+				.filter((id) => !Number.isNaN(id));
+			if (numericIds.length > 0) {
+				const batches: number[][] = [];
+				for (let i = 0; i < numericIds.length; i += GET_PROFILES_CHUNK_IDS) {
+					batches.push(numericIds.slice(i, i + GET_PROFILES_CHUNK_IDS));
+				}
+				try {
+					const responses = await Promise.all(
+						batches.map(async (targetProfileIds) => {
+							const res = await fetchRest("/v3/profiles", {
+								method: "POST",
+								body: { targetProfileIds },
+							});
+							if (res.status < 200 || res.status >= 300) {
+								appLog.warn(`[browse] POST /v3/profiles batch returned ${res.status}`);
+								return [];
+							}
+							const data = await parseJsonSafe(res);
+							if (
+								typeof data === "object" &&
+								data !== null &&
+								Array.isArray((data as { profiles?: unknown }).profiles)
+							) {
+								return (data as { profiles: unknown[] }).profiles;
+							}
+							return [];
+						}),
+					);
+					for (const profile of responses.flat()) {
+						if (typeof profile === "object" && profile !== null) {
+							const record = profile as Record<string, unknown>;
+							if (typeof record.profileId === "string" || typeof record.profileId === "number") {
+								hydratedByProfileId.set(String(record.profileId), record);
+							}
+						}
+					}
+				} catch (error) {
+					appLog.warn("[browse] Failed to resolve lazy/partial cascade profiles", error);
 				}
 			}
+
+			const nowMs = Date.now();
+			const cards: BrowseCard[] = entries.map(({ card }) => {
+				const resolved = hydratedByProfileId.get(card.profileId);
+				if (!resolved) {
+					return card;
+				}
+				const resolvedImage = normalizePrimaryImageUrl(resolved, null);
+				const lastChatTs =
+					typeof resolved.lastChatTimestamp === "number" ? resolved.lastChatTimestamp : null;
+				const resolvedChatted =
+					lastChatTs !== null ? nowMs - lastChatTs < 24 * 60 * 60 * 1000 : undefined;
+				return {
+					...card,
+					displayName:
+						card.displayName ??
+						(typeof resolved.displayName === "string" ? resolved.displayName : null),
+					age: card.age ?? (typeof resolved.age === "number" ? resolved.age : null),
+					distanceMeters:
+						card.distanceMeters ??
+						(typeof resolved.distance === "number" ? resolved.distance : null),
+					primaryImageUrl: card.primaryImageUrl ?? resolvedImage ?? null,
+					onlineUntil:
+						card.onlineUntil ??
+						(typeof resolved.onlineUntil === "number" ? resolved.onlineUntil : null),
+					lastOnline:
+						card.lastOnline ?? (typeof resolved.seen === "number" ? resolved.seen : null),
+					favorite:
+						card.favorite ??
+						(typeof resolved.isFavorite === "boolean" ? resolved.isFavorite : undefined),
+					chatted: card.chatted ?? resolvedChatted,
+					rightNow:
+						card.rightNow ??
+						(typeof resolved.rightNow === "string" ? resolved.rightNow : null),
+				};
+			});
+
 			return {
 				cards,
 				nextPage: parsed.nextPage ?? null,

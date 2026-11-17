@@ -102,6 +102,10 @@ const SETTINGS_ORDER: [SettingsOrder; 8] = [
 ];
 
 const OKHTTP_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+const OKHTTP_FIRST_STREAM_ID: u32 = 3;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const OKHTTP_POOL_IDLE: Duration = Duration::from_secs(5 * 60);
+const OKHTTP_MAX_IDLE_CONNECTIONS: usize = 5;
 
 #[derive(Debug)]
 struct VersionInfo {
@@ -110,6 +114,7 @@ struct VersionInfo {
 }
 
 static VERSION_INFO: OnceLock<VersionInfo> = OnceLock::new();
+#[allow(dead_code)]
 static LOCALE_INFO: OnceLock<(String, String)> = OnceLock::new();
 
 fn fetch_version_info() -> Option<VersionInfo> {
@@ -124,13 +129,23 @@ fn fetch_version_info() -> Option<VersionInfo> {
     }
 
     let parsed = response.json::<VersionJson>().ok()?;
-    if parsed.app_version.trim().is_empty() || parsed.build_number.trim().is_empty() {
+    let raw_version = parsed.app_version.trim();
+    let build_number = parsed.build_number.trim().to_string();
+    if raw_version.is_empty() || build_number.is_empty() {
         return None;
     }
 
+    // GrindrPlus version.json reports "26.24.0" without the ".<build>" suffix expected in User-Agent
+    let suffix = format!(".{build_number}");
+    let app_version = if raw_version.ends_with(&suffix) {
+        raw_version.to_string()
+    } else {
+        format!("{raw_version}.{build_number}")
+    };
+
     Some(VersionInfo {
-        app_version: parsed.app_version,
-        build_number: parsed.build_number,
+        app_version,
+        build_number,
     })
 }
 
@@ -145,6 +160,7 @@ fn version_info() -> &'static VersionInfo {
 
 /// Returns `(l_locale, accept_language)`, e.g. `("en_US", "en-US")`, derived from the
 /// device's OS locale (BCP-47, as reported by `sys_locale` via `tauri_plugin_os::locale`).
+#[allow(dead_code)]
 fn locale_info() -> &'static (String, String) {
     LOCALE_INFO.get_or_init(|| {
         let raw = tauri_plugin_os::locale().unwrap_or_else(|| "en-US".to_string());
@@ -190,11 +206,11 @@ impl Default for DeviceInfo {
         Self {
             device_type: 2,
             device_id,
-            android_version: "13",
+            android_version: "14",
             screen_resolution: "2400x1080",
             total_ram: "8026152960",
             advertising_id: uuid::Uuid::new_v4().to_string(),
-            device_model: "Pixel 7",
+            device_model: "Pixel 8",
             manufacturer: "Google",
         }
     }
@@ -214,6 +230,7 @@ fn okhttp_tls_config() -> TlsConfig {
 
 fn okhttp_http2_config() -> Http2Config {
     Http2Config::builder()
+        .initial_stream_id(OKHTTP_FIRST_STREAM_ID)
         .initial_stream_window_size(OKHTTP_WINDOW_SIZE)
         .initial_connection_window_size(OKHTTP_WINDOW_SIZE)
         .headers_pseudo_order(PSEUDO_ORDER)
@@ -236,6 +253,10 @@ pub fn build_grindr_client() -> Result<Client, wreq::Error> {
         .no_deflate()
         .no_brotli()
         .no_zstd()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_idle_timeout(OKHTTP_POOL_IDLE)
+        .pool_max_idle_per_host(OKHTTP_MAX_IDLE_CONNECTIONS)
+        .tcp_keepalive(None)
         .build()
 }
 
@@ -315,15 +336,16 @@ pub fn build_headers(
 #[cfg(debug_assertions)]
 eprintln!("[HTTP] Grindr User-Agent: {user_agent}");
     // 7. L-Locale
-    let (l_locale, accept_language) = locale_info();
-    if let Ok(value) = HeaderValue::from_str(l_locale) {
-        headers.push((HeaderName::from_static("l-locale"), value));
-    }
+    headers.push((
+        HeaderName::from_static("l-locale"),
+        HeaderValue::from_static("en_US"),
+    ));
 
     // 8. Accept-Language
-    if let Ok(value) = HeaderValue::from_str(accept_language) {
-        headers.push((HeaderName::from_static("accept-language"), value));
-    }
+    headers.push((
+        HeaderName::from_static("accept-language"),
+        HeaderValue::from_static("en-US"),
+    ));
 
     // 9. Accept-Encoding
     headers.push((

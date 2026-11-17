@@ -12,6 +12,9 @@ use super::client::GrindrClient;
 use super::client::BASE_URL;
 use super::headers::{build_headers, DeviceInfo};
 
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+const ACCEPT_ENCODING: &str = "accept-encoding";
+
 #[derive(Serialize, Deserialize)]
 pub struct RawResponse {
     pub status: u16,
@@ -53,6 +56,38 @@ impl GrindrClient {
         req
     }
 
+    fn build_configured_request(
+        &self,
+        method: Method,
+        url: &str,
+        path: &str,
+        device: &DeviceInfo,
+        auth_token: Option<&str>,
+        body_bytes: Option<&[u8]>,
+        content_type: Option<&str>,
+    ) -> wreq::RequestBuilder {
+        let mut req = self.http.request(method, url);
+        if path.starts_with("/v8/sessions") || path.starts_with("/v9/sessions") {
+            req = req.header("requirerealdeviceinfo", "true");
+        } else if path.starts_with("/public/") {
+            req = req.header("requireanondeviceinfo", "true");
+        }
+        let headers = build_headers(device, "Free", auth_token);
+        // OkHttp emits Content-Type and Content-Length before Accept-Encoding: gzip
+        let (encoding, others): (Vec<_>, Vec<_>) = headers
+            .into_iter()
+            .partition(|(name, _)| name.as_str() == ACCEPT_ENCODING);
+        req = Self::apply_headers(req, &others);
+        if let Some(bytes) = body_bytes {
+            let ct = content_type.unwrap_or(JSON_CONTENT_TYPE);
+            req = req
+                .header("content-type", ct)
+                .header("content-length", bytes.len().to_string())
+                .body(bytes.to_vec());
+        }
+        Self::apply_headers(req, &encoding)
+    }
+
     pub(super) async fn request_json<TReq, TResp>(
         &self,
         method: Method,
@@ -63,7 +98,8 @@ impl GrindrClient {
         TReq: Serialize + ?Sized,
         TResp: DeserializeOwned,
     {
-        let is_auth_path = path.starts_with("/v8/sessions") || path.starts_with("/public/");
+        let is_auth_path =
+            path.starts_with("/v8/sessions") || path.starts_with("/v9/sessions") || path.starts_with("/public/");
         let url = if path.starts_with("http") {
             path.to_owned()
         } else {
@@ -79,19 +115,20 @@ impl GrindrClient {
             }
         }
 
+        let body_bytes = body.map(serde_json::to_vec).transpose()?;
         let device = self.device.read().await;
 
-        let make_request = |auth_token: Option<String>, device: &DeviceInfo| {
-            let headers = build_headers(device, "Free", auth_token.as_deref());
-            let mut req = Self::apply_headers(self.http.request(method.clone(), &url), &headers);
-            if let Some(body) = body {
-                req = req.json(body);
-            }
-            req
-        };
-
         let auth_token = self.authorization_header().await;
-        let mut response = make_request(auth_token.clone(), &device)
+        let mut response = self
+            .build_configured_request(
+                method.clone(),
+                &url,
+                path,
+                &device,
+                auth_token.as_deref(),
+                body_bytes.as_deref(),
+                Some(JSON_CONTENT_TYPE),
+            )
             .send()
             .await
             .map_err(|e| {
@@ -113,7 +150,16 @@ impl GrindrClient {
 
             let new_auth_token = self.authorization_header().await;
             let device = self.device.read().await;
-            response = make_request(new_auth_token, &device)
+            response = self
+                .build_configured_request(
+                    method.clone(),
+                    &url,
+                    path,
+                    &device,
+                    new_auth_token.as_deref(),
+                    body_bytes.as_deref(),
+                    Some(JSON_CONTENT_TYPE),
+                )
                 .send()
                 .await
                 .map_err(|e| {
@@ -167,7 +213,8 @@ impl GrindrClient {
         body: Option<Vec<u8>>,
         content_type: Option<&str>,
     ) -> Result<RawResponse, AppError> {
-        let is_auth_path = path.starts_with("/v8/sessions") || path.starts_with("/public/");
+        let is_auth_path =
+            path.starts_with("/v8/sessions") || path.starts_with("/v9/sessions") || path.starts_with("/public/");
         let url = if path.starts_with("http") {
             path.to_owned()
         } else {
@@ -196,24 +243,18 @@ impl GrindrClient {
 
         let device = self.device.read().await;
 
-        let make_request = |auth_token: Option<String>, device: &DeviceInfo| {
-            let headers = build_headers(device, "Free", auth_token.as_deref());
-            let mut req = Self::apply_headers(self.http.request(method.clone(), &url), &headers);
-
-            if let Some(ref body_bytes) = body {
-                req = req.body(body_bytes.clone());
-
-                if let Some(content_type) = content_type {
-                    req = req.header("Content-Type", content_type);
-                } else {
-                    req = req.header("Content-Type", "application/json");
-                }
-            }
-
-            req
-        };
-
-        let mut response = make_request(auth_token.clone(), &device).send().await
+        let mut response = self
+            .build_configured_request(
+                method.clone(),
+                &url,
+                path,
+                &device,
+                auth_token.as_deref(),
+                body.as_deref(),
+                content_type,
+            )
+            .send()
+            .await
             .map_err(|e| AppError::Http(e.to_string()))?;
         #[cfg(debug_assertions)]
         eprintln!(
@@ -235,7 +276,18 @@ impl GrindrClient {
 
             let new_auth_token = self.authorization_header().await;
             let device = self.device.read().await;
-            response = make_request(new_auth_token, &device).send().await
+            response = self
+                .build_configured_request(
+                    method.clone(),
+                    &url,
+                    path,
+                    &device,
+                    new_auth_token.as_deref(),
+                    body.as_deref(),
+                    content_type,
+                )
+                .send()
+                .await
                 .map_err(|e| AppError::Http(e.to_string()))?;
         }
 

@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - development
+      - Free-Open
   workflow_dispatch:
 
 permissions:
