@@ -3,17 +3,19 @@ name: Build iOS IPA
 on:
   push:
     branches:
-      - main
-      - development
       - Free-Open
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
   build-ios-ipa:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
