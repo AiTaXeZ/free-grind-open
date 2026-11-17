@@ -3,10 +3,12 @@ import {
 	AlertCircle,
 	Bell,
 	Bug,
+	Check,
 	CheckCircle2,
 	ChevronLeft,
 	ChevronRight,
 	ClipboardList,
+	Copy,
 	DatabaseBackup,
 	Download,
 	EyeOff,
@@ -15,6 +17,7 @@ import {
 	HelpCircle,
 	Images,
 	Info,
+	KeyRound,
 	Loader2,
 	LogOut,
 	Megaphone,
@@ -295,6 +298,229 @@ function ContributorChannelDialog({
 	);
 }
 
+type ExportableAccountEntry = {
+	profileId: string;
+	label: string;
+	email: string;
+	photoHash: string | null;
+	isActive: boolean;
+};
+
+function TokenExportDialog({
+	isOpen,
+	accounts,
+	selectedIds,
+	onToggleId,
+	onSelectAll,
+	onClearAll,
+	onCopySelected,
+	onCopyCurrent,
+	onCopyAll,
+	onClose,
+	isCopying,
+	activeProfileId,
+}: {
+	isOpen: boolean;
+	accounts: ExportableAccountEntry[];
+	selectedIds: Set<string>;
+	onToggleId: (profileId: string) => void;
+	onSelectAll: () => void;
+	onClearAll: () => void;
+	onCopySelected: () => void;
+	onCopyCurrent: () => void;
+	onCopyAll: () => void;
+	onClose: () => void;
+	isCopying: boolean;
+	activeProfileId: string | null;
+}) {
+	const { t } = useTranslation();
+	const dialogRef = useRef<HTMLDialogElement>(null);
+
+	useEffect(() => {
+		const dialog = dialogRef.current;
+		if (!dialog) return;
+		if (isOpen) {
+			if (!dialog.open) {
+				try {
+					dialog.showModal();
+				} catch {
+					dialog.show();
+				}
+			}
+		} else if (dialog.open) {
+			dialog.close();
+		}
+	}, [isOpen]);
+
+	useEffect(() => {
+		return () => {
+			const dialog = dialogRef.current;
+			if (dialog?.open) {
+				dialog.close();
+			}
+		};
+	}, []);
+
+	useEffect(() => {
+		const dialog = dialogRef.current;
+		if (!dialog) return;
+		const handleCancel = (event: Event) => {
+			event.preventDefault();
+			if (!isCopying) onClose();
+		};
+		dialog.addEventListener("cancel", handleCancel);
+		return () => dialog.removeEventListener("cancel", handleCancel);
+	}, [isCopying, onClose]);
+
+	return (
+		<dialog
+			ref={dialogRef}
+			className="fixed inset-0 m-auto h-fit w-[calc(100%-2rem)] max-w-md rounded-2xl border border-[var(--border)] bg-[color-mix(in_srgb,var(--surface)_92%,black_8%)] p-0 text-[var(--text)] shadow-2xl backdrop:bg-black/45"
+			onClick={(event) => {
+				if (event.target === dialogRef.current && !isCopying) onClose();
+			}}
+		>
+			<div className="p-4">
+				<div className="flex items-center justify-between gap-2">
+					<p className="text-sm font-semibold text-[var(--text)]">
+						{t("settings.copy_tokens_modal_title", { defaultValue: "Copy Login Tokens" })}
+					</p>
+					<button
+						type="button"
+						onClick={onClose}
+						disabled={isCopying}
+						className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-[var(--text-muted)] transition hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-50"
+					>
+						<X className="h-4 w-4" />
+					</button>
+				</div>
+				<p className="mt-1.5 text-xs leading-relaxed text-[var(--text-muted)]">
+					{t("settings.copy_tokens_modal_desc", {
+						defaultValue: "Portable tokens include your active session & refresh token so you can paste them into Sign In with Token on Windows, Android, or iOS.",
+					})}
+				</p>
+
+				<div className="mt-3 flex flex-wrap gap-2">
+					{activeProfileId && (
+						<button
+							type="button"
+							onClick={onCopyCurrent}
+							disabled={isCopying}
+							className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-xs font-semibold text-[var(--text)] transition hover:border-[var(--accent)] disabled:opacity-50"
+						>
+							<KeyRound className="h-3.5 w-3.5" />
+							<span>{t("settings.copy_current_token", { defaultValue: "Copy current" })}</span>
+						</button>
+					)}
+					{accounts.length > 1 && (
+						<button
+							type="button"
+							onClick={onCopyAll}
+							disabled={isCopying}
+							className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-xs font-semibold text-[var(--text)] transition hover:border-[var(--accent)] disabled:opacity-50"
+						>
+							<Copy className="h-3.5 w-3.5" />
+							<span>
+								{t("settings.copy_all_tokens", {
+									defaultValue: "Copy all ({{count}})",
+									count: accounts.length,
+								})}
+							</span>
+						</button>
+					)}
+				</div>
+
+				<div className="mt-4 flex items-center justify-between">
+					<span className="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+						{t("settings.select_accounts", { defaultValue: "Select accounts" })}
+					</span>
+					<div className="flex items-center gap-2 text-xs">
+						<button type="button" onClick={onSelectAll} disabled={isCopying} className="font-medium text-[var(--accent)] hover:underline">
+							{t("data_backup.select_all", { defaultValue: "Select all" })}
+						</button>
+						<span className="text-[var(--text-muted)]">·</span>
+						<button type="button" onClick={onClearAll} disabled={isCopying} className="font-medium text-[var(--text-muted)] hover:text-[var(--text)]">
+							{t("data_backup.deselect_all", { defaultValue: "Clear" })}
+						</button>
+					</div>
+				</div>
+
+				<div className="mt-2 max-h-60 space-y-1.5 overflow-y-auto pr-1">
+					{accounts.map((acc) => {
+						const checked = selectedIds.has(acc.profileId);
+						return (
+							<button
+								key={acc.profileId}
+								type="button"
+								onClick={() => onToggleId(acc.profileId)}
+								disabled={isCopying}
+								className={`flex w-full items-center gap-2.5 rounded-xl border px-3 py-2 text-left transition ${
+									checked
+										? "border-[var(--accent)]/50 bg-[var(--accent)]/10"
+										: "border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--surface-2)]"
+								}`}
+							>
+								<Avatar
+									src={acc.photoHash ? getThumbImageUrl(acc.photoHash, "75x75") : null}
+									alt=""
+									className="h-8 w-8 shrink-0 rounded-xl border-0"
+								/>
+								<div className="min-w-0 flex-1">
+									<div className="flex items-center gap-1.5">
+										<p className="truncate text-xs font-semibold text-[var(--text)]">{acc.label}</p>
+										{acc.isActive && (
+											<span className="rounded bg-[var(--accent)]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
+												{t("settings.active_badge", { defaultValue: "Active" })}
+											</span>
+										)}
+									</div>
+									<p className="truncate text-[11px] text-[var(--text-muted)]">
+										{acc.email || `ID: ${acc.profileId}`}
+									</p>
+								</div>
+								<span
+									className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition ${
+										checked
+											? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-contrast)]"
+											: "border-[var(--border)] bg-transparent text-transparent"
+									}`}
+								>
+									<Check className="h-3.5 w-3.5" strokeWidth={3} />
+								</span>
+							</button>
+						);
+					})}
+				</div>
+
+				<div className="mt-5 flex gap-2">
+					<button
+						type="button"
+						onClick={onClose}
+						disabled={isCopying}
+						className="inline-flex h-11 flex-1 items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] px-4 text-sm font-medium text-[var(--text-muted)] transition hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
+					>
+						{t("common.cancel", { defaultValue: "Cancel" })}
+					</button>
+					<button
+						type="button"
+						onClick={onCopySelected}
+						disabled={isCopying || selectedIds.size === 0}
+						className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-xl border border-[var(--accent)] bg-[var(--accent)] px-4 text-sm font-semibold text-[var(--accent-contrast)] transition hover:brightness-110 disabled:opacity-60"
+					>
+						{isCopying ? <Loader2 className="h-4 w-4 animate-spin" /> : <Copy className="h-4 w-4" />}
+						<span>
+							{t("settings.copy_selected_tokens", {
+								defaultValue: "Copy selected ({{count}})",
+								count: selectedIds.size,
+							})}
+						</span>
+					</button>
+				</div>
+			</div>
+		</dialog>
+	);
+}
+
 export function SettingsPage() {
 	const { t } = useTranslation();
 	const { userId, logout, savedAccounts, switchAccount, removeSavedAccount } = useAuth();
@@ -313,6 +539,9 @@ export function SettingsPage() {
 	}, [searchQuery, settingsSearchIndex]);
 	const [switchingProfileId, setSwitchingProfileId] = useState<string | null>(null);
 	const [removingProfileId, setRemovingProfileId] = useState<string | null>(null);
+	const [copyingTokenKey, setCopyingTokenKey] = useState<string | null>(null);
+	const [isTokenDialogOpen, setIsTokenDialogOpen] = useState(false);
+	const [selectedTokenIds, setSelectedTokenIds] = useState<Set<string>>(new Set());
 	const [isLoggingOut, setIsLoggingOut] = useState(false);
 	// "active" = end the current session; a profile id = forget that saved
 	// (non-active) account — both are presented the same way (logout icon +
@@ -429,6 +658,73 @@ export function SettingsPage() {
 			setRemovingProfileId(null);
 			setLogoutConfirmTarget(null);
 		}
+	};
+
+	const exportableAccounts = useMemo<ExportableAccountEntry[]>(() => {
+		const entries: ExportableAccountEntry[] = [];
+		const seen = new Set<string>();
+		if (userId != null) {
+			const activeId = String(userId);
+			const activeMeta = savedAccounts.find((a) => a.profileId === activeId);
+			const activeProfile = getSavedAccountProfile(activeId);
+			seen.add(activeId);
+			entries.push({
+				profileId: activeId,
+				label: activeProfile.displayName || activeMeta?.email || activeId,
+				email: activeMeta?.email || "",
+				photoHash: activeProfile.photoHash,
+				isActive: true,
+			});
+		}
+		for (const account of savedAccounts) {
+			if (seen.has(account.profileId)) continue;
+			seen.add(account.profileId);
+			const savedProfile = getSavedAccountProfile(account.profileId);
+			entries.push({
+				profileId: account.profileId,
+				label: savedProfile.displayName || account.email || account.profileId,
+				email: account.email,
+				photoHash: savedProfile.photoHash,
+				isActive: false,
+			});
+		}
+		return entries;
+	}, [userId, savedAccounts]);
+
+	const handleCopyLoginTokens = async (profileIds?: string[], key = "custom") => {
+		if (copyingTokenKey) return;
+		setCopyingTokenKey(key);
+		try {
+			const token = await callMethod(
+				"export_login_tokens",
+				profileIds && profileIds.length > 0 ? { profileIds } : {},
+			);
+			await navigator.clipboard.writeText(token);
+			toast.success(
+				profileIds && profileIds.length === 1
+					? t("settings.token_copied_single", {
+							defaultValue: "Login token copied. Paste in Sign In with Token on any device.",
+						})
+					: t("settings.token_copied_all", {
+							defaultValue: "Login tokens copied. Paste in Sign In with Token on any device.",
+						}),
+			);
+			setIsTokenDialogOpen(false);
+		} catch (error) {
+			toast.error(
+				getErrorMessage(
+					error,
+					t("settings.token_copy_failed", { defaultValue: "Failed to copy login token." }),
+				),
+			);
+		} finally {
+			setCopyingTokenKey(null);
+		}
+	};
+
+	const openTokenExportDialog = () => {
+		setSelectedTokenIds(new Set(exportableAccounts.map((a) => a.profileId)));
+		setIsTokenDialogOpen(true);
 	};
 
 	const handleCheckUpdates = async () => {
@@ -711,6 +1007,22 @@ export function SettingsPage() {
 											</p>
 										</div>
 									</button>
+									{userId != null && (
+										<button
+											type="button"
+											onClick={() => void handleCopyLoginTokens([String(userId)], "active")}
+											disabled={copyingTokenKey !== null}
+											aria-label={t("settings.copy_login_token", { defaultValue: "Copy login token" })}
+											title={t("settings.copy_login_token", { defaultValue: "Copy login token" })}
+											className="shrink-0 rounded-xl p-2.5 text-[var(--text-muted)] transition hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-50"
+										>
+											{copyingTokenKey === "active" ? (
+												<Loader2 className="h-4 w-4 animate-spin text-[var(--accent)]" />
+											) : (
+												<KeyRound className="h-4 w-4" />
+											)}
+										</button>
+									)}
 									<button
 										type="button"
 										onClick={() => setLogoutConfirmTarget("active")}
@@ -760,6 +1072,20 @@ export function SettingsPage() {
 										</button>
 										<button
 											type="button"
+											onClick={() => void handleCopyLoginTokens([account.profileId], account.profileId)}
+											disabled={copyingTokenKey !== null || isSwitching || isRemoving}
+											aria-label={t("settings.copy_login_token", { defaultValue: "Copy login token" })}
+											title={t("settings.copy_login_token", { defaultValue: "Copy login token" })}
+											className="shrink-0 rounded-xl p-2.5 text-[var(--text-muted)] transition hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-50"
+										>
+											{copyingTokenKey === account.profileId ? (
+												<Loader2 className="h-4 w-4 animate-spin text-[var(--accent)]" />
+											) : (
+												<KeyRound className="h-4 w-4" />
+											)}
+										</button>
+										<button
+											type="button"
 											onClick={() => setLogoutConfirmTarget(account.profileId)}
 											disabled={isSwitching || isRemoving}
 											aria-label={t("settings.logout")}
@@ -770,6 +1096,28 @@ export function SettingsPage() {
 									</div>
 								);
 							})}
+						{exportableAccounts.length > 0 && (
+							<button
+								type="button"
+								onClick={openTokenExportDialog}
+								className="flex w-full items-center gap-3 px-4 py-3.5 text-left transition-colors hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)]"
+							>
+								<div className="shrink-0 rounded-2xl bg-[var(--accent)]/15 p-2.5 text-[var(--accent)]">
+									<Copy className="h-5 w-5" />
+								</div>
+								<div className="min-w-0 flex-1">
+									<p className="text-sm font-semibold leading-snug">
+										{t("settings.copy_login_tokens", { defaultValue: "Copy login tokens" })}
+									</p>
+									<p className="mt-0.5 text-xs leading-snug text-[var(--text-muted)]">
+										{t("settings.copy_login_tokens_desc", {
+											defaultValue: "Copy current, selected, or all accounts to sign in on any device",
+										})}
+									</p>
+								</div>
+								<ChevronRight className="h-4 w-4 shrink-0 text-[var(--text-muted)] opacity-50" />
+							</button>
+						)}
 						<button
 							type="button"
 							onClick={() => navigate("/auth/sign-in?mode=add-profile")}
@@ -1267,6 +1615,42 @@ export function SettingsPage() {
 					setContributorCodeInput("");
 				}}
 				isProcessing={isActivatingContributor}
+			/>
+
+			<TokenExportDialog
+				isOpen={isTokenDialogOpen}
+				accounts={exportableAccounts}
+				selectedIds={selectedTokenIds}
+				activeProfileId={userId != null ? String(userId) : null}
+				isCopying={copyingTokenKey !== null}
+				onToggleId={(profileId) => {
+					setSelectedTokenIds((prev) => {
+						const next = new Set(prev);
+						if (next.has(profileId)) {
+							next.delete(profileId);
+						} else {
+							next.add(profileId);
+						}
+						return next;
+					});
+				}}
+				onSelectAll={() => setSelectedTokenIds(new Set(exportableAccounts.map((a) => a.profileId)))}
+				onClearAll={() => setSelectedTokenIds(new Set())}
+				onCopyCurrent={() => {
+					if (userId != null) {
+						void handleCopyLoginTokens([String(userId)], "modal-current");
+					}
+				}}
+				onCopyAll={() =>
+					void handleCopyLoginTokens(
+						exportableAccounts.map((a) => a.profileId),
+						"modal-all",
+					)
+				}
+				onCopySelected={() =>
+					void handleCopyLoginTokens(Array.from(selectedTokenIds), "modal-selected")
+				}
+				onClose={() => setIsTokenDialogOpen(false)}
 			/>
 		</section>
 	);

@@ -14,7 +14,13 @@ import {
 	PHAssetCollectionType,
 	PHAssetCollectionSubtype,
 } from "@gbyte/tauri-plugin-ios-photos";
-import { AndroidFs, AndroidPublicGeneralPurposeDir, type AndroidFsUri } from "tauri-plugin-android-fs-api";
+import {
+	AndroidFs,
+	AndroidPublicGeneralPurposeDir,
+	AndroidPublicImageDir,
+	AndroidPublicVideoDir,
+	type AndroidFsUri,
+} from "tauri-plugin-android-fs-api";
 import { isTauriRuntime } from "./tauriWebSocket";
 import { toDataUri } from "./mediaStore";
 import * as chatDb from "./chatDb";
@@ -75,7 +81,51 @@ function recordDownloadedMediaEntry(entry: Omit<DownloadedMediaEntry, "savedAt">
 	});
 }
 
+async function ensureFallbackAlbumId(): Promise<string | null> {
+	try {
+		const smartAlbums = await requestAlbums({
+			with: PHAssetCollectionType.smartAlbum,
+			subtype: PHAssetCollectionSubtype.smartAlbumUserLibrary,
+		});
+		if (smartAlbums[0]?.id) return smartAlbums[0].id;
+	} catch {
+		// Fall through to regular albums lookup.
+	}
+	try {
+		const regularAlbums = await requestAlbums({
+			with: PHAssetCollectionType.album,
+			subtype: PHAssetCollectionSubtype.any,
+		});
+		return regularAlbums[0]?.id ?? null;
+	} catch {
+		return null;
+	}
+}
+
 async function fetchMediaBytes(url: string): Promise<{ bytes: Uint8Array; contentType: string | null }> {
+	if (url.startsWith("data:")) {
+		const commaIdx = url.indexOf(",");
+		if (commaIdx === -1) {
+			throw new Error("Invalid data URI");
+		}
+		const meta = url.slice(5, commaIdx);
+		const payload = url.slice(commaIdx + 1);
+		const isBase64 = /;base64$/i.test(meta);
+		const contentType = meta.replace(/;base64$/i, "").trim() || null;
+		if (isBase64) {
+			return { bytes: base64ToBytes(payload), contentType };
+		}
+		const decoded = decodeURIComponent(payload);
+		return { bytes: new TextEncoder().encode(decoded), contentType };
+	}
+
+	if (url.startsWith("blob:")) {
+		const response = await globalThis.fetch(url);
+		if (!response.ok) throw new Error(`Failed to read local media (${response.status})`);
+		const bytes = new Uint8Array(await response.arrayBuffer());
+		return { bytes, contentType: response.headers.get("content-type") };
+	}
+
 	const response = await fetch(url);
 	if (!response.ok) throw new Error(`Failed to download media (${response.status})`);
 	const bytes = new Uint8Array(await response.arrayBuffer());
@@ -169,17 +219,31 @@ async function saveMediaBytesToGallery(
 	}
 
 	try {
-		const albumId = await ensureAlbumId();
-		const created = type === "video"
-			? await createVideos({ album: albumId, files: [absolutePath] })
-			: await createPhotos({ album: albumId, files: [absolutePath] });
+		let targetAlbumId: string | null = null;
+		let created: string[] | null = null;
+		try {
+			targetAlbumId = await ensureAlbumId();
+			created = type === "video"
+				? await createVideos({ album: targetAlbumId, files: [absolutePath] })
+				: await createPhotos({ album: targetAlbumId, files: [absolutePath] });
+		} catch (primaryError) {
+			const fallbackAlbumId = await ensureFallbackAlbumId();
+			if (!fallbackAlbumId || fallbackAlbumId === targetAlbumId) {
+				throw primaryError;
+			}
+			appLog.warn("[saveMedia] Falling back to user Photos library album", primaryError);
+			targetAlbumId = fallbackAlbumId;
+			created = type === "video"
+				? await createVideos({ album: targetAlbumId, files: [absolutePath] })
+				: await createPhotos({ album: targetAlbumId, files: [absolutePath] });
+		}
 		if (!created || created.length === 0) {
 			throw new Error("Photos library did not return a created asset");
 		}
 		recordDownloadedMediaEntry({
 			identifier: created[0],
 			platform: "ios",
-			albumId,
+			albumId: targetAlbumId,
 			byteSize: bytes.byteLength,
 			mimeType,
 			kind: type,
@@ -195,6 +259,46 @@ async function saveMediaBytesToGallery(
 	}
 }
 
+async function createAndroidMediaUri(
+	relativePath: string,
+	mimeType: string,
+	type: "image" | "video",
+): Promise<AndroidFsUri> {
+	const baseDirs =
+		type === "video"
+			? [AndroidPublicVideoDir.DCIM, AndroidPublicVideoDir.Movies, AndroidPublicGeneralPurposeDir.Download]
+			: [AndroidPublicImageDir.DCIM, AndroidPublicImageDir.Pictures, AndroidPublicGeneralPurposeDir.Download];
+
+	let lastError: unknown;
+	for (const dir of baseDirs) {
+		try {
+			return type === "video"
+				? await AndroidFs.createNewPublicVideoFile(dir, relativePath, mimeType, { isPending: true })
+				: await AndroidFs.createNewPublicImageFile(dir, relativePath, mimeType, { isPending: true });
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw lastError ?? new Error("Failed to create Android public media entry");
+}
+
+async function writeAndroidMediaUri(uri: AndroidFsUri, bytes: Uint8Array): Promise<void> {
+	try {
+		const writable = await AndroidFs.openWriteFileStream(uri);
+		const writer = writable.getWriter();
+		try {
+			await writer.write(bytes);
+			await writer.close();
+		} catch (error) {
+			await writer.abort(error).catch(() => {});
+			throw error;
+		}
+	} catch (streamError) {
+		appLog.warn("[saveMedia] openWriteFileStream failed, falling back to writeFile", streamError);
+		await AndroidFs.writeFile(uri, bytes);
+	}
+}
+
 async function saveMediaBytesToGalleryAndroid(
 	bytes: Uint8Array,
 	mimeTypeIn: string | null,
@@ -206,12 +310,10 @@ async function saveMediaBytesToGalleryAndroid(
 	const fileName = `${Date.now()}-${Math.random().toString(36).slice(2)}.${extension}`;
 	const relativePath = `${await mediaRelativeDir(conversationId)}/${fileName}`;
 
-	const uri = type === "video"
-		? await AndroidFs.createNewPublicVideoFile(AndroidPublicGeneralPurposeDir.Download, relativePath, mimeType, { isPending: true })
-		: await AndroidFs.createNewPublicImageFile(AndroidPublicGeneralPurposeDir.Download, relativePath, mimeType, { isPending: true });
+	const uri = await createAndroidMediaUri(relativePath, mimeType, type);
 
 	try {
-		await AndroidFs.writeFile(uri, bytes);
+		await writeAndroidMediaUri(uri, bytes);
 		await AndroidFs.setPublicFilePending(uri, false);
 		await AndroidFs.scanPublicFile(uri);
 		recordDownloadedMediaEntry({

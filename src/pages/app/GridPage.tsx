@@ -1,5 +1,6 @@
 import { useAuth } from "../../contexts/useAuth";
-import { MapPin, Navigation, SlidersHorizontal, ListFilter, Star, Plane, Search, Eye, EyeOff, Check, Loader2, RefreshCw, Settings, X } from "lucide-react";
+import { useApi } from "../../hooks/useApi";
+import { MapPin, Navigation, SlidersHorizontal, ListFilter, Star, Plane, Search, Eye, EyeOff, Check, Copy, KeyRound, Loader2, RefreshCw, Settings, X } from "lucide-react";
 import { RightNowIcon } from "../../components/icons/RightNowIcon";
 import { useLocation, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
@@ -84,6 +85,7 @@ export function GridPage() {
 	const TAP_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 	const { userId, savedAccounts, switchAccount, settingsReady } = useAuth();
+	const { callMethod } = useApi();
 	const apiFunctions = useApiFunctions();
 	const {
 		geohash,
@@ -359,6 +361,7 @@ export function GridPage() {
 	const [isLocationOpen, setIsLocationOpen] = useState(false);
 	const [isAccountSwitcherOpen, setIsAccountSwitcherOpen] = useState(false);
 	const [switchingProfileId, setSwitchingProfileId] = useState<string | null>(null);
+	const [copyingTokenKey, setCopyingTokenKey] = useState<string | null>(null);
 	const accountSwitcherRef = useRef<HTMLDivElement>(null);
 
 	const {
@@ -431,6 +434,35 @@ export function GridPage() {
 			toast.error(error instanceof Error ? error.message : "Failed to switch account.");
 		} finally {
 			setSwitchingProfileId(null);
+		}
+	};
+
+	const handleCopyTokens = async (profileIds?: string[], key = "all") => {
+		if (copyingTokenKey) return;
+		setCopyingTokenKey(key);
+		try {
+			const payload = await callMethod(
+				"export_login_tokens",
+				profileIds && profileIds.length > 0 ? { profileIds } : {},
+			);
+			await navigator.clipboard.writeText(payload);
+			toast.success(
+				profileIds && profileIds.length === 1
+					? t("settings.token_copied_single", {
+							defaultValue: "Login token copied. Paste in Sign In with Token on any device.",
+						})
+					: t("settings.token_copied_all", {
+							defaultValue: "Login tokens copied. Paste in Sign In with Token on any device.",
+						}),
+			);
+		} catch (error) {
+			toast.error(
+				error instanceof Error
+					? error.message
+					: t("settings.token_copy_failed", { defaultValue: "Failed to copy login token." }),
+			);
+		} finally {
+			setCopyingTokenKey(null);
 		}
 	};
 
@@ -1461,17 +1493,11 @@ export function GridPage() {
 								<div ref={accountSwitcherRef} className="relative shrink-0">
 									<button
 										type="button"
-										onClick={() => {
-											if (savedAccounts.length <= 1) {
-												navigate("/settings");
-											} else {
-												setIsAccountSwitcherOpen((v) => !v);
-											}
-										}}
+										onClick={() => setIsAccountSwitcherOpen((v) => !v)}
 										className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full ring-2 ring-transparent transition-all hover:ring-[var(--border)] hover:brightness-110 active:scale-95"
-										aria-label={t("browse_page.open_settings")}
+										aria-label={t("browse_page.open_account_switcher", { defaultValue: "Account switcher" })}
 										aria-expanded={isAccountSwitcherOpen}
-										title={t("browse_page.settings")}
+										title={t("browse_page.open_account_switcher", { defaultValue: "Account switcher" })}
 									>
 										<Avatar
 											src={profilePhotoUrl}
@@ -1479,64 +1505,129 @@ export function GridPage() {
 											className="h-full w-full"
 										/>
 									</button>
-									{isAccountSwitcherOpen && (
-									<div className="absolute left-0 top-full z-50 mt-2 w-max min-w-[14rem] max-w-[calc(100vw-2*var(--app-px))] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 shadow-xl animate-in fade-in zoom-in-95 slide-in-from-top-2 duration-150">
-										<div className="flex flex-col gap-1">
-											{savedAccounts.map((account) => {
-												const isActive = userId != null && String(userId) === account.profileId;
-												const isSwitching = switchingProfileId === account.profileId;
-												const savedProfile = getSavedAccountProfile(account.profileId);
-												return (
+									{isAccountSwitcherOpen && (() => {
+										const switcherAccounts =
+											savedAccounts.length > 0
+												? savedAccounts
+												: userId != null
+													? [{ profileId: String(userId), email: "", lastUsedAt: 0 }]
+													: [];
+										return (
+										<div className="absolute left-0 top-full z-50 mt-2 w-max min-w-[15.5rem] max-w-[calc(100vw-2*var(--app-px))] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3 shadow-xl animate-in fade-in zoom-in-95 slide-in-from-top-2 duration-150">
+											<div className="flex flex-col gap-1">
+												{switcherAccounts.map((account) => {
+													const isActive = userId != null && String(userId) === account.profileId;
+													const isSwitching = switchingProfileId === account.profileId;
+													const isCopyingRow = copyingTokenKey === `row:${account.profileId}`;
+													const savedProfile = getSavedAccountProfile(account.profileId);
+													return (
+														<div key={account.profileId} className="flex min-w-0 items-center gap-1">
+															<button
+																type="button"
+																onClick={() => void handleSwitchAccount(account.profileId)}
+																disabled={isActive || isSwitching}
+																className="flex min-w-0 flex-1 items-center gap-2.5 rounded-sm px-1.5 py-1.5 text-left transition-colors hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)] disabled:cursor-default"
+															>
+																<div className="relative h-10 w-10 shrink-0">
+																	<Avatar
+																		src={savedProfile.photoHash ? getThumbImageUrl(savedProfile.photoHash, "75x75") : null}
+																		alt=""
+																		className="h-full w-full rounded-full border-0"
+																	/>
+																	{isSwitching && (
+																		<div className="absolute inset-0 flex items-center justify-center rounded-full bg-[var(--surface)]/80">
+																			<Loader2 className="h-4 w-4 animate-spin text-[var(--accent)]" />
+																		</div>
+																	)}
+																	{isActive && (
+																		<div className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-white ring-2 ring-[var(--surface)]">
+																			<Check className="h-2.5 w-2.5" strokeWidth={3} />
+																		</div>
+																	)}
+																</div>
+																<div className="min-w-0 flex-1">
+																	<p className="truncate text-sm font-semibold leading-snug text-[var(--text)]">
+																		{savedProfile.displayName || account.email || account.profileId}
+																	</p>
+																	{account.email && (
+																		<p className="truncate text-xs text-[var(--text-muted)] leading-snug mt-0.5">
+																			{account.email}
+																		</p>
+																	)}
+																</div>
+															</button>
+															<button
+																type="button"
+																onClick={(e) => {
+																	e.stopPropagation();
+																	void handleCopyTokens([account.profileId], `row:${account.profileId}`);
+																}}
+																disabled={copyingTokenKey !== null}
+																aria-label={t("settings.copy_login_token", { defaultValue: "Copy login token" })}
+																title={t("settings.copy_login_token", { defaultValue: "Copy login token" })}
+																className="shrink-0 rounded-md p-1.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-50"
+															>
+																{isCopyingRow ? (
+																	<Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+																) : (
+																	<Copy className="h-3.5 w-3.5" />
+																)}
+															</button>
+														</div>
+													);
+												})}
+											</div>
+											<div className="-mx-3 mt-2 flex flex-col gap-1 border-t border-[var(--border)] px-3 pt-2">
+												{userId != null && (
 													<button
-														key={account.profileId}
 														type="button"
-														onClick={() => void handleSwitchAccount(account.profileId)}
-														disabled={isActive || isSwitching}
-														className="flex min-w-0 items-center gap-2.5 rounded-sm px-1.5 py-1.5 text-left transition-colors hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)] disabled:cursor-default"
+														onClick={() => void handleCopyTokens([String(userId)], "current")}
+														disabled={copyingTokenKey !== null}
+														className="flex w-full items-center justify-center gap-1.5 rounded-sm py-1.5 text-xs font-semibold text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-50"
 													>
-														<div className="relative h-10 w-10 shrink-0">
-															<Avatar
-																src={savedProfile.photoHash ? getThumbImageUrl(savedProfile.photoHash, "75x75") : null}
-																alt=""
-																className="h-full w-full rounded-full border-0"
-															/>
-															{isSwitching && (
-																<div className="absolute inset-0 flex items-center justify-center rounded-full bg-[var(--surface)]/80">
-																	<Loader2 className="h-4 w-4 animate-spin text-[var(--accent)]" />
-																</div>
-															)}
-															{isActive && (
-																<div className="absolute -bottom-0.5 -right-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-white ring-2 ring-[var(--surface)]">
-																	<Check className="h-2.5 w-2.5" strokeWidth={3} />
-																</div>
-															)}
-														</div>
-														<div className="min-w-0 flex-1">
-															<p className="truncate text-sm font-semibold leading-snug text-[var(--text)]">
-																{savedProfile.displayName || t("settings.account_unnamed", { defaultValue: "Someone" })}
-															</p>
-															{account.email && (
-																<p className="truncate text-xs text-[var(--text-muted)] leading-snug mt-0.5">
-																	{account.email}
-																</p>
-															)}
-														</div>
+														{copyingTokenKey === "current" ? (
+															<Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+														) : (
+															<KeyRound className="h-3.5 w-3.5" />
+														)}
+														{t("settings.copy_current_token", { defaultValue: "Copy current token" })}
 													</button>
-												);
-											})}
+												)}
+												{switcherAccounts.length > 1 && (
+													<button
+														type="button"
+														onClick={() =>
+															void handleCopyTokens(
+																switcherAccounts.map((a) => a.profileId),
+																"all",
+															)
+														}
+														disabled={copyingTokenKey !== null}
+														className="flex w-full items-center justify-center gap-1.5 rounded-sm py-1.5 text-xs font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--surface-2)] disabled:opacity-50"
+													>
+														{copyingTokenKey === "all" ? (
+															<Loader2 className="h-3.5 w-3.5 animate-spin" />
+														) : (
+															<Copy className="h-3.5 w-3.5" />
+														)}
+														{t("settings.copy_all_tokens", {
+															defaultValue: "Copy all tokens ({{count}})",
+															count: switcherAccounts.length,
+														})}
+													</button>
+												)}
+												<button
+													type="button"
+													onClick={() => { setIsAccountSwitcherOpen(false); navigate("/settings"); }}
+													className="flex w-full items-center justify-center gap-1.5 rounded-sm py-1.5 text-xs font-semibold text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+												>
+													<Settings className="h-3.5 w-3.5" />
+													{t("browse_page.settings")}
+												</button>
+											</div>
 										</div>
-										<div className="-mx-3 mt-2 border-t border-[var(--border)] px-3 pt-2">
-											<button
-												type="button"
-												onClick={() => { setIsAccountSwitcherOpen(false); navigate("/settings"); }}
-												className="flex w-full items-center justify-center gap-1.5 rounded-sm py-1.5 text-xs font-semibold text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
-											>
-												<Settings className="h-3.5 w-3.5" />
-												{t("browse_page.settings")}
-											</button>
-										</div>
-									</div>
-								)}
+										);
+									})()}
 								</div>
 
 								<div

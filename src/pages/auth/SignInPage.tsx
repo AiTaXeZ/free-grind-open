@@ -6,7 +6,7 @@ import { Button } from "../../components/ui/button";
 import { BugReportButton } from "../../components/ui/BugReportButton";
 import type { SignInMethod } from "../../types/auth";
 import { useTranslation } from "react-i18next";
-import { Mail, Lock, KeyRound, AlertCircle, ExternalLink, Eye, EyeOff } from "lucide-react";
+import { Mail, Lock, KeyRound, AlertCircle, HelpCircle, ChevronDown, ChevronUp, ClipboardPaste, Eye, EyeOff } from "lucide-react";
 import { cn } from "../../utils/cn";
 
 function AuthMethodTab({
@@ -104,6 +104,7 @@ export function SignInPage() {
 	const [isPasswordLoading, setIsPasswordLoading] = useState(false);
 
 	const [jwtToken, setJwtToken] = useState("");
+	const [showTokenGuide, setShowTokenGuide] = useState(false);
 	const [isTokenLoading, setIsTokenLoading] = useState(false);
 	const [isFacebookLoading, setIsFacebookLoading] = useState(false);
 
@@ -136,6 +137,17 @@ export function SignInPage() {
 			// AuthContext updates `error`, which is rendered in the form.
 		} finally {
 			setIsTokenLoading(false);
+		}
+	};
+
+	const handlePasteToken = async () => {
+		try {
+			const clip = await navigator.clipboard?.readText();
+			if (clip?.trim()) {
+				setJwtToken(clip.trim());
+			}
+		} catch {
+			// Ignore clipboard permission errors in restricted webviews.
 		}
 	};
 
@@ -272,15 +284,53 @@ export function SignInPage() {
 			) : (
 				<form key="token" onSubmit={handleTokenSubmit} className="animate-fade-in space-y-3">
 					<div>
-						<a
-							href="https://freegrinddocs.imaoreo.dev/guide/login"
-							target="_blank"
-							rel="noreferrer"
-							className="mb-2 flex items-start gap-1.5 text-xs font-medium leading-relaxed text-[var(--accent)] hover:underline"
+						<button
+							type="button"
+							onClick={() => setShowTokenGuide((v) => !v)}
+							aria-expanded={showTokenGuide}
+							className="mb-2 flex items-center gap-1.5 text-xs font-medium leading-relaxed text-[var(--accent)] hover:underline"
 						>
-							<ExternalLink className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-							<span>{t("auth.sign_in.token_help")}</span>
-						</a>
+							<HelpCircle className="h-3.5 w-3.5 shrink-0" />
+							<span>{t("auth.sign_in.token_help", { defaultValue: "How to get your login token" })}</span>
+							{showTokenGuide ? (
+								<ChevronUp className="h-3.5 w-3.5 shrink-0" />
+							) : (
+								<ChevronDown className="h-3.5 w-3.5 shrink-0" />
+							)}
+						</button>
+						{showTokenGuide ? (
+							<div className="mb-3 space-y-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)]/70 p-3 text-xs leading-relaxed text-[var(--text-muted)]">
+								<p className="font-semibold text-[var(--text)]">
+									{t("auth.sign_in.token_guide_title", { defaultValue: "Works on Windows, Android & iOS:" })}
+								</p>
+								<ol className="list-decimal space-y-1.5 pl-4">
+									<li>
+										<span className="font-medium text-[var(--text)]">
+											{t("auth.sign_in.token_guide_device_label", { defaultValue: "From another FreeGrind device:" })}
+										</span>{" "}
+										{t("auth.sign_in.token_guide_device", {
+											defaultValue: "Open the profile Account Switcher or Settings → Profile → Copy Login Token (fg1:... for one account, fgbundle1:... for multiple accounts).",
+										})}
+									</li>
+									<li>
+										<span className="font-medium text-[var(--text)]">
+											{t("auth.sign_in.token_guide_web_label", { defaultValue: "From web.grindr.com (desktop browser):" })}
+										</span>{" "}
+										{t("auth.sign_in.token_guide_web", {
+											defaultValue: "Sign in, open DevTools (F12) → Network tab, select any v3/v4/v8 request (e.g. sessions), and copy the Authorization header (Grindr3 eyJ...) or raw session JSON.",
+										})}
+									</li>
+									<li>
+										<span className="font-medium text-[var(--text)]">
+											{t("auth.sign_in.token_guide_tp_label", { defaultValue: "Facebook or Apple account:" })}
+										</span>{" "}
+										{t("auth.sign_in.token_guide_tp", {
+											defaultValue: "Paste a Facebook access token (EAA...) or redirect URL. For Apple Sign-In accounts, sideloaded apps cannot run native Apple auth — use Forgot Password on web.grindr.com with your Apple ID or @privaterelay.appleid.com email to set a password or extract a session token.",
+										})}
+									</li>
+								</ol>
+							</div>
+						) : null}
 						<IconInput
 							icon={<KeyRound className="h-4 w-4" />}
 							type="text"
@@ -288,8 +338,19 @@ export function SignInPage() {
 							onChange={(e) => setJwtToken(e.target.value)}
 							required
 							autoFocus
-							placeholder="eyJhbGciOi..."
+							placeholder="fg1:... / fgbundle1:... / eyJhbGciOi..."
 							autoComplete="off"
+							rightSlot={
+								<button
+									type="button"
+									onClick={() => void handlePasteToken()}
+									aria-label={t("auth.sign_in.paste_token", { defaultValue: "Paste token from clipboard" })}
+									title={t("auth.sign_in.paste_token", { defaultValue: "Paste token from clipboard" })}
+									className="text-[var(--text-muted)] transition-colors hover:text-[var(--text)]"
+								>
+									<ClipboardPaste className="h-4 w-4" />
+								</button>
+							}
 						/>
 					</div>
 					<AuthSubmitSection

@@ -37,3 +37,28 @@
 [2026-11-17 21:27] - Task: Add Free-Open push trigger to build-fork.yml and Build-iOS.yml workflows
 - Modified: `.github/workflows/build-fork.yml`
 - Modified: `.github/workflows/Build-iOS.yml`
+
+[2026-11-18 00:13] - Task: Add portable login token/bundle export & import (`fg1:`, `fgbundle1:`, JSON, wrapped JWT) and register `export_login_tokens`
+- Modified: `src-tauri/src/api/auth.rs`
+- Modified: `src-tauri/src/lib.rs`
+
+[2026-11-18 00:16] - Task: Enable cross-account and non-destructive backup combine, selective restore, and backup unit tests in `backup.rs`
+- Modified: `src-tauri/src/commands/backup.rs`
+
+[2026-11-18 00:17] - Task: Add `export_login_tokens` API schema and multi-file selective/cross-account backup combine UI with Select all/Clear toggles and phrase merge
+- Modified: `src/types/api.ts`
+- Modified: `src/services/backupRestore.ts`
+- Modified: `src/pages/app/SettingsDataPage.tsx`
+
+[2026-11-18 00:21] - Task: Add inline multi-source token guide + Paste button in `SignInPage`, Copy Login Token controls in `GridPage` switcher and `SettingsPage` Profile + selectable token modal
+- Modified: `src/pages/auth/SignInPage.tsx`
+- Modified: `src/pages/app/GridPage.tsx`
+- Modified: `src/pages/app/SettingsPage.tsx`
+
+[2026-11-18 00:24] - Task: Improve photo reel / album saving (`data:`/`blob:` fetch, Android `DCIM/FreeGrind` public dirs + stream write, iOS fallback album), 1-tap `PhotoViewer` Save button, and album tap-to-view + Save All in `SettingsAlbumsPage`
+- Modified: `src/services/saveMedia.ts`
+- Modified: `src/components/PhotoViewer.tsx`
+- Modified: `src/pages/app/SettingsAlbumsPage.tsx`
+
+[2026-11-18 00:24] - Task: Add `bun run type-check`, `bun run build`, and `cargo test --lib` to `build-fork.yml` workflow
+- Modified: `.github/workflows/build-fork.yml`

@@ -733,43 +733,58 @@ export function PhotoViewer({
 							)}
 						</div>
 
-						<div ref={menuRef} className="relative shrink-0">
+						<div className="flex shrink-0 items-center gap-2">
 							<button
 								type="button"
-								onClick={() => setIsMenuOpen((v) => !v)}
+								onClick={(e) => { e.stopPropagation(); void handleSave(); }}
 								onTouchStart={(e) => { e.stopPropagation(); gestureMovedRef.current = false; }}
-								onTouchEnd={(e) => handleButtonTouchEnd(e, () => setIsMenuOpen((v) => !v))}
-								aria-label="More options"
-								aria-expanded={isMenuOpen}
-								className="inline-flex shrink-0 items-center justify-center rounded-xl border border-white/45 bg-black/40 p-2 text-white backdrop-blur-md transition active:scale-90"
+								onTouchEnd={(e) => handleButtonTouchEnd(e, () => void handleSave())}
+								disabled={isSaving}
+								aria-label={t("profile_details.save")}
+								title={t("profile_details.save")}
+								className="inline-flex shrink-0 items-center justify-center rounded-xl border border-white/45 bg-black/40 p-2 text-white backdrop-blur-md transition active:scale-90 disabled:opacity-50"
 							>
-								<EllipsisVertical className="h-4 w-4" />
+								{isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
 							</button>
-							{isMenuOpen && (
-								<div className="absolute right-0 top-[calc(100%+0.5rem)] min-w-[200px] overflow-hidden rounded-xl border border-white/15 bg-black/90 py-1.5 shadow-xl backdrop-blur-md">
-									<button
-										type="button"
-										onClick={() => { setIsMenuOpen(false); void handleSave(); }}
-										disabled={isSaving}
-										className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-white transition hover:bg-white/10 disabled:opacity-50"
-									>
-										<Download className="h-4 w-4 opacity-80" />
-										{t("profile_details.save")}
-									</button>
-									{menuActions.map((action) => (
+
+							<div ref={menuRef} className="relative shrink-0">
+								<button
+									type="button"
+									onClick={() => setIsMenuOpen((v) => !v)}
+									onTouchStart={(e) => { e.stopPropagation(); gestureMovedRef.current = false; }}
+									onTouchEnd={(e) => handleButtonTouchEnd(e, () => setIsMenuOpen((v) => !v))}
+									aria-label="More options"
+									aria-expanded={isMenuOpen}
+									className="inline-flex shrink-0 items-center justify-center rounded-xl border border-white/45 bg-black/40 p-2 text-white backdrop-blur-md transition active:scale-90"
+								>
+									<EllipsisVertical className="h-4 w-4" />
+								</button>
+								{isMenuOpen && (
+									<div className="absolute right-0 top-[calc(100%+0.5rem)] min-w-[200px] overflow-hidden rounded-xl border border-white/15 bg-black/90 py-1.5 shadow-xl backdrop-blur-md">
 										<button
-											key={action.key}
 											type="button"
-											onClick={() => { setIsMenuOpen(false); void action.onClick(); }}
-											disabled={action.disabled}
+											onClick={() => { setIsMenuOpen(false); void handleSave(); }}
+											disabled={isSaving}
 											className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-white transition hover:bg-white/10 disabled:opacity-50"
 										>
-											<action.icon className="h-4 w-4 opacity-80" />
-											{action.label}
+											<Download className="h-4 w-4 opacity-80" />
+											{t("profile_details.save")}
 										</button>
-									))}
-								</div>
-							)}
+										{menuActions.map((action) => (
+											<button
+												key={action.key}
+												type="button"
+												onClick={() => { setIsMenuOpen(false); void action.onClick(); }}
+												disabled={action.disabled}
+												className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-sm text-white transition hover:bg-white/10 disabled:opacity-50"
+											>
+												<action.icon className="h-4 w-4 opacity-80" />
+												{action.label}
+											</button>
+										))}
+									</div>
+								)}
+							</div>
 						</div>
 					</div>
 				</div>
@@ -797,7 +812,7 @@ export function PhotoViewer({
 						style={{ top: chromeButtonTop }}
 						aria-label={t("profile_details.save")}
 					>
-						<Download className="h-4 w-4" />
+						{isSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
 					</button>
 				</>
 			)}

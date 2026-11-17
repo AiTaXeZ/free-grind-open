@@ -34,6 +34,15 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      - name: Type-check frontend
+        run: bun run type-check
+
+      - name: Build frontend
+        run: bun run build
+
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
       - name: Build Windows installer
         run: bunx tauri build --bundles nsis
 

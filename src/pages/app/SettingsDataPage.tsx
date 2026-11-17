@@ -73,9 +73,16 @@ export function SettingsDataPage() {
 	const [exportCategories, setExportCategories] = useState<Set<BackupCategoryId>>(new Set(BACKUP_CATEGORY_IDS));
 	const [showExportCategoryPicker, setShowExportCategoryPicker] = useState(false);
 	const [pendingImport, setPendingImport] = useState<{
-		tempPath: string;
+		items: {
+			tempPath: string;
+			fileName: string;
+			categories: BackupCategoryId[];
+			ownerUserId?: number;
+			isDifferentOwner?: boolean;
+		}[];
 		categories: BackupCategoryId[];
 		selected: Set<BackupCategoryId>;
+		hasDifferentOwner: boolean;
 	} | null>(null);
 
 	const [savedPhrases, setSavedPhrases] = useState<string[]>([]);
@@ -234,28 +241,60 @@ export function SettingsDataPage() {
 		);
 	};
 
-	const handleImportFile = async (file: File) => {
+	const handleImportFiles = async (fileList: FileList | File[]) => {
+		const files = Array.from(fileList);
+		if (files.length === 0) return;
 		if (userId == null) {
 			toast.error(t("data_backup.import_no_user", { defaultValue: "You must be signed in to import." }));
 			return;
 		}
 		setIsImporting(true);
-		// Copy the picked file to disk first (streamed, so a large archive
-		// never sits fully in WebView memory), then hand a plain path to
-		// Rust for inspection — only once we know which categories are
-		// actually in the file do we ask the user which of those to restore.
-		const tempPath = await copyPickedFileToTemp(file);
+		const copiedPaths: string[] = [];
 		try {
-			const inspection = await inspectBackupFile(tempPath, userId);
-			if (!inspection.ok) {
-				showImportError(inspection.error);
-				await cleanupTempFile(tempPath);
-				return;
+			const items: {
+				tempPath: string;
+				fileName: string;
+				categories: BackupCategoryId[];
+				ownerUserId?: number;
+				isDifferentOwner?: boolean;
+			}[] = [];
+			const unionSet = new Set<BackupCategoryId>();
+			let hasDifferentOwner = false;
+
+			for (const file of files) {
+				const tempPath = await copyPickedFileToTemp(file);
+				copiedPaths.push(tempPath);
+				const inspection = await inspectBackupFile(tempPath, userId);
+				if (!inspection.ok) {
+					showImportError(inspection.error);
+					await Promise.all(copiedPaths.map((p) => cleanupTempFile(p)));
+					return;
+				}
+				for (const category of inspection.categories) {
+					unionSet.add(category);
+				}
+				if (inspection.isDifferentOwner) {
+					hasDifferentOwner = true;
+				}
+				items.push({
+					tempPath,
+					fileName: file.name,
+					categories: inspection.categories,
+					ownerUserId: inspection.ownerUserId,
+					isDifferentOwner: inspection.isDifferentOwner,
+				});
 			}
-			setPendingImport({ tempPath, categories: inspection.categories, selected: new Set(inspection.categories) });
+
+			const availableCategories = BACKUP_CATEGORY_IDS.filter((id) => unionSet.has(id));
+			setPendingImport({
+				items,
+				categories: availableCategories,
+				selected: new Set(availableCategories),
+				hasDifferentOwner,
+			});
 		} catch (error) {
 			toast.error(getErrorMessage(error, t("data_backup.import_failed", { defaultValue: "Failed to import data." })));
-			await cleanupTempFile(tempPath);
+			await Promise.all(copiedPaths.map((p) => cleanupTempFile(p)));
 		} finally {
 			setIsImporting(false);
 		}
@@ -263,7 +302,7 @@ export function SettingsDataPage() {
 
 	const handleCancelImport = () => {
 		if (pendingImport) {
-			void cleanupTempFile(pendingImport.tempPath);
+			void Promise.all(pendingImport.items.map((item) => cleanupTempFile(item.tempPath)));
 		}
 		setPendingImport(null);
 	};
@@ -274,15 +313,23 @@ export function SettingsDataPage() {
 		}
 		setIsImporting(true);
 		try {
-			const result = await importBackupFile(
-				chatDb.getActiveChatDbFileName(),
-				userId,
-				pendingImport.tempPath,
-				Array.from(pendingImport.selected),
-			);
-			if (!result.ok) {
-				showImportError(result.error);
-				return;
+			let totalRows = 0;
+			for (const item of pendingImport.items) {
+				const selectedForFile = item.categories.filter((c) => pendingImport.selected.has(c));
+				if (selectedForFile.length === 0) {
+					continue;
+				}
+				const result = await importBackupFile(
+					chatDb.getActiveChatDbFileName(),
+					userId,
+					item.tempPath,
+					selectedForFile,
+				);
+				if (!result.ok) {
+					showImportError(result.error);
+					return;
+				}
+				totalRows += result.rowsImported;
 			}
 			// A full import can touch conversations, messages, and every
 			// setting (automation, privacy, browse filters, location, etc.),
@@ -292,10 +339,10 @@ export function SettingsDataPage() {
 			toast.success(
 				t("data_backup.import_success", {
 					defaultValue: "Imported {{count}} rows. Reloading…",
-					count: result.rowsImported,
+					count: totalRows,
 				}),
 			);
-			await cleanupTempFile(pendingImport.tempPath);
+			await Promise.all(pendingImport.items.map((item) => cleanupTempFile(item.tempPath)));
 			setPendingImport(null);
 			window.location.reload();
 		} catch (error) {
@@ -400,7 +447,9 @@ export function SettingsDataPage() {
 				toast.error(t("data_backup.phrases_import_empty", { defaultValue: "No valid phrases found in that file." }));
 				return;
 			}
-			const updated = await saveSavedPhrases(imported);
+			const existing = await loadSavedPhrases();
+			const combined = Array.from(new Set([...existing, ...imported]));
+			const updated = await saveSavedPhrases(combined);
 			setSavedPhrases(updated);
 			toast.success(t("data_backup.phrases_import_success", { defaultValue: "Saved phrases imported." }));
 		} catch {
@@ -534,11 +583,11 @@ export function SettingsDataPage() {
 							</div>
 							<div className="min-w-0 flex-1">
 								<p className="text-sm font-semibold leading-snug">
-									{t("data_backup.import", { defaultValue: "Import data" })}
+									{t("data_backup.import", { defaultValue: "Import & combine data" })}
 								</p>
 								<p className="mt-0.5 text-xs leading-snug text-[var(--text-muted)]">
 									{t("data_backup.import_card_desc", {
-										defaultValue: "Merge a previously exported file back in — nothing already here is erased. The app reloads afterwards.",
+										defaultValue: "Select one or more backup files to merge selectively — existing data is preserved. The app reloads afterwards.",
 									})}
 								</p>
 							</div>
@@ -551,12 +600,13 @@ export function SettingsDataPage() {
 						<input
 							ref={fileInputRef}
 							type="file"
+							multiple
 							accept="application/zip,.zip"
 							className="hidden"
 							onChange={(event) => {
-								const file = event.target.files?.[0];
+								const files = event.target.files ? Array.from(event.target.files) : [];
 								event.target.value = "";
-								if (file) void handleImportFile(file);
+								if (files.length > 0) void handleImportFiles(files);
 							}}
 						/>
 
@@ -564,7 +614,7 @@ export function SettingsDataPage() {
 							<ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
 							<p className="text-xs leading-relaxed text-[var(--text-muted)]">
 								{t("data_backup.backup_note", {
-									defaultValue: "Exports are tied to your profile — a file can only be imported back into the same account it came from.",
+									defaultValue: "Pick one or multiple backups to combine selectively, including exports from another account (chats, outgoing messages, and albums remap to your active profile).",
 								})}
 							</p>
 						</div>
@@ -797,6 +847,25 @@ export function SettingsDataPage() {
 						</SheetClose>
 					</div>
 					<div className="min-h-0 flex-1 overflow-y-auto pb-4" data-lenis-prevent>
+						<div className="mb-2 flex items-center justify-end gap-2 px-4">
+							<button
+								type="button"
+								onClick={() => setExportCategories(new Set(BACKUP_CATEGORY_IDS))}
+								disabled={isExporting}
+								className="text-xs font-medium text-[var(--accent)] hover:underline disabled:opacity-50"
+							>
+								{t("data_backup.select_all", { defaultValue: "Select all" })}
+							</button>
+							<span className="text-xs text-[var(--text-muted)]">·</span>
+							<button
+								type="button"
+								onClick={() => setExportCategories(new Set())}
+								disabled={isExporting}
+								className="text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-50"
+							>
+								{t("data_backup.deselect_all", { defaultValue: "Clear" })}
+							</button>
+						</div>
 						<BackupCategoryPicker categories={BACKUP_CATEGORY_IDS} selected={exportCategories} onToggle={toggleExportCategory} />
 					</div>
 					<div className="flex gap-2 px-4 pb-4 pt-2">
@@ -840,11 +909,44 @@ export function SettingsDataPage() {
 						</SheetClose>
 					</div>
 					<div className="min-h-0 flex-1 overflow-y-auto pb-4" data-lenis-prevent>
-						<p className="mb-3 px-4 text-xs leading-relaxed text-[var(--text-muted)]">
-							{t("data_backup.import_categories_desc", {
-								defaultValue: "Only categories present in this file can be restored.",
-							})}
+						<p className="mb-2 px-4 text-xs leading-relaxed text-[var(--text-muted)]">
+							{pendingImport.items.length > 1
+								? t("data_backup.import_combine_multi_desc", {
+										defaultValue: "Combining {{count}} backup archives cleanly without erasing existing records.",
+										count: pendingImport.items.length,
+									})
+								: t("data_backup.import_categories_desc", {
+										defaultValue: "Choose which categories from this backup to merge into your data.",
+									})}
 						</p>
+						{pendingImport.hasDifferentOwner && (
+							<div className="mx-4 mb-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-300">
+								{t("data_backup.import_cross_owner_note", {
+									defaultValue: "Includes a backup from another account — conversations, outgoing messages, and albums will be remapped to your active profile.",
+								})}
+							</div>
+						)}
+						<div className="mb-2 flex items-center justify-end gap-2 px-4">
+							<button
+								type="button"
+								onClick={() =>
+									setPendingImport((prev) => (prev ? { ...prev, selected: new Set(prev.categories) } : prev))
+								}
+								disabled={isImporting}
+								className="text-xs font-medium text-[var(--accent)] hover:underline disabled:opacity-50"
+							>
+								{t("data_backup.select_all", { defaultValue: "Select all" })}
+							</button>
+							<span className="text-xs text-[var(--text-muted)]">·</span>
+							<button
+								type="button"
+								onClick={() => setPendingImport((prev) => (prev ? { ...prev, selected: new Set() } : prev))}
+								disabled={isImporting}
+								className="text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-50"
+							>
+								{t("data_backup.deselect_all", { defaultValue: "Clear" })}
+							</button>
+						</div>
 						<BackupCategoryPicker categories={pendingImport.categories} selected={pendingImport.selected} onToggle={toggleImportCategory} />
 					</div>
 					<div className="flex gap-2 px-4 pb-4 pt-2">

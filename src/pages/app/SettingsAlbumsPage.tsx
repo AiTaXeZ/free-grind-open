@@ -3,6 +3,7 @@ import {
 	Check,
 	ChevronDown,
 	Clock,
+	Download,
 	Film,
 	FolderPlus,
 	GripVertical,
@@ -33,6 +34,8 @@ import toast from "react-hot-toast";
 import { useApiFunctions } from "../../hooks/useApiFunctions";
 import { useDesktopBreakpoint } from "../../hooks/useDesktopBreakpoint";
 import { ConfirmDialog } from "../../components/ui/confirm-dialog";
+import { PhotoViewer, type PhotoViewerMedia } from "../../components/PhotoViewer";
+import { saveMediaBatch } from "../../services/saveMedia";
 import {
 	EmptyState,
 	ErrorState,
@@ -100,6 +103,7 @@ type SortableAlbumMediaItemProps = {
 	index: number;
 	isReordering: boolean;
 	isDeleting: boolean;
+	onOpenClick: () => void;
 	onDeleteClick: () => void;
 };
 
@@ -108,6 +112,7 @@ function SortableAlbumMediaItem({
 	index,
 	isReordering,
 	isDeleting,
+	onOpenClick,
 	onDeleteClick,
 }: SortableAlbumMediaItemProps) {
 	const { t } = useTranslation();
@@ -131,11 +136,18 @@ function SortableAlbumMediaItem({
 			className={`relative overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-2)] ${isDragging ? "z-10 opacity-40" : ""}`}
 		>
 			{imageUrl ? (
-				<img
-					src={imageUrl}
-					alt={t("settings_albums.media_alt", { index: index + 1 })}
-					className={`aspect-square w-full object-cover ${isRejected ? "opacity-40 grayscale" : ""}`}
-				/>
+				<button
+					type="button"
+					onClick={onOpenClick}
+					className="block w-full cursor-pointer text-left"
+					title={t("settings_albums.view_media", { defaultValue: "View & save" })}
+				>
+					<img
+						src={imageUrl}
+						alt={t("settings_albums.media_alt", { index: index + 1 })}
+						className={`aspect-square w-full object-cover transition hover:brightness-105 ${isRejected ? "opacity-40 grayscale" : ""}`}
+					/>
+				</button>
 			) : (
 				<div className="aspect-square w-full bg-[var(--surface)]" />
 			)}
@@ -231,6 +243,69 @@ export function SettingsAlbumsPage() {
 	const [confirmDeleteAlbumId, setConfirmDeleteAlbumId] = useState<string | null>(null);
 	const [confirmDeleteContentKey, setConfirmDeleteContentKey] = useState<string | null>(null);
 	const [editOpenedAlbumId, setEditOpenedAlbumId] = useState<string | null>(null);
+	const [viewerMedia, setViewerMedia] = useState<{ photos: PhotoViewerMedia[]; index: number } | null>(null);
+	const [savingAllAlbumId, setSavingAllAlbumId] = useState<string | null>(null);
+
+	const openAlbumMediaViewer = useCallback((detail: AlbumDetail, targetContentId: string) => {
+		const viewable = detail.content
+			.map((entry) => {
+				const url = entry.url || entry.coverUrl || entry.thumbUrl || "";
+				if (!url) return null;
+				return {
+					contentId: entry.contentId,
+					media: {
+						url,
+						type: entry.contentType?.startsWith("video/") ? ("video" as const) : ("image" as const),
+					},
+				};
+			})
+			.filter((x): x is { contentId: string; media: PhotoViewerMedia } => x !== null);
+		if (viewable.length === 0) return;
+		const idx = Math.max(0, viewable.findIndex((x) => x.contentId === targetContentId));
+		setViewerMedia({ photos: viewable.map((x) => x.media), index: idx });
+	}, []);
+
+	const handleSaveAllAlbumMedia = useCallback(async (albumId: string, detail: AlbumDetail) => {
+		if (savingAllAlbumId) return;
+		const items = detail.content
+			.map((entry) => {
+				const url = entry.url || entry.coverUrl || entry.thumbUrl || "";
+				if (!url) return null;
+				return {
+					url,
+					type: entry.contentType?.startsWith("video/") ? ("video" as const) : ("image" as const),
+				};
+			})
+			.filter((x): x is { url: string; type: "image" | "video" } => x !== null);
+		if (items.length === 0) {
+			toast.error(t("settings_albums.save_all_empty", { defaultValue: "No downloadable media in this album." }));
+			return;
+		}
+		setSavingAllAlbumId(albumId);
+		try {
+			const res = await saveMediaBatch(items);
+			if (res.failed === 0) {
+				toast.success(
+					t("settings_albums.save_all_success", {
+						defaultValue: "Saved {{count}} item(s) to your photo album.",
+						count: res.succeeded,
+					}),
+				);
+			} else if (res.succeeded > 0) {
+				toast.success(
+					t("settings_albums.save_all_partial", {
+						defaultValue: "Saved {{saved}} of {{total}} item(s).",
+						saved: res.succeeded,
+						total: res.total,
+					}),
+				);
+			} else {
+				toast.error(t("settings_albums.save_all_failed", { defaultValue: "Failed to save album media." }));
+			}
+		} finally {
+			setSavingAllAlbumId(null);
+		}
+	}, [savingAllAlbumId, t]);
 
 	// Drawer picker state ("add to album" from own chat drawer media)
 	const [drawerMedia, setDrawerMedia] = useState<DrawerMedia[]>([]);
@@ -1037,11 +1112,11 @@ export function SettingsAlbumsPage() {
 										{isOpen && (
 											<div className="border-t border-[var(--border)] p-4">
 												{/* Media toolbar */}
-												<div className="mb-3 flex items-center justify-between gap-2">
+												<div className="mb-3 flex flex-wrap items-center justify-between gap-2">
 													<p className="text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">
 														{t("settings_albums.section_content", { defaultValue: "Content" })}
 													</p>
-													<div className="flex items-center gap-1.5">
+													<div className="flex flex-wrap items-center gap-1.5">
 														<input
 															id={uploadInputId}
 															type="file"
@@ -1065,6 +1140,20 @@ export function SettingsAlbumsPage() {
 															<Inbox className="h-3.5 w-3.5" />
 															{t("settings_albums.add_from_drawer", { defaultValue: "Add from Drawer" })}
 														</button>
+														{detail && detail.content.length > 0 && (
+															<button
+																type="button"
+																onClick={() => void handleSaveAllAlbumMedia(album.albumId, detail)}
+																disabled={savingAllAlbumId !== null}
+																className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[var(--border)] px-2.5 text-xs font-medium transition hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+																title={t("settings_albums.save_all", { defaultValue: "Save album media to device" })}
+															>
+																<Download className="h-3.5 w-3.5" />
+																{savingAllAlbumId === album.albumId
+																	? t("settings_albums.saving", { defaultValue: "Saving…" })
+																	: t("settings_albums.save_all", { defaultValue: "Save all" })}
+															</button>
+														)}
 														<button
 															type="button"
 															onClick={() => {
@@ -1103,6 +1192,7 @@ export function SettingsAlbumsPage() {
 																			index={index}
 																			isReordering={reorderingAlbumId === album.albumId}
 																			isDeleting={deletingContentKey === deleteKey}
+																			onOpenClick={() => openAlbumMediaViewer(detail, item.contentId)}
 																			onDeleteClick={() => setConfirmDeleteContentKey(deleteKey)}
 																		/>
 																	);
@@ -1266,6 +1356,15 @@ export function SettingsAlbumsPage() {
 					/>
 				);
 			})() : null}
+
+			{viewerMedia && (
+				<PhotoViewer
+					isOpen={viewerMedia !== null}
+					onClose={() => setViewerMedia(null)}
+					photos={viewerMedia.photos}
+					initialIndex={viewerMedia.index}
+				/>
+			)}
 		</section>
 	);
 }

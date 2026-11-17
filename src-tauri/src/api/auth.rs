@@ -1,5 +1,9 @@
 #[cfg(not(any(target_os = "windows", all(target_os = "macos", debug_assertions))))]
 use keyring_core::Entry;
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::path::PathBuf;
@@ -50,6 +54,167 @@ fn decode_session_msgpack(bytes: &[u8]) -> Result<Session, AppError> {
         advertising_id: legacy.advertising_id,
         third_party_user_id: None,
     })
+}
+
+const PORTABLE_SESSION_PREFIX: &str = "fg1:";
+const PORTABLE_BUNDLE_PREFIX: &str = "fgbundle1:";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PortableAccountBundle {
+    version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_profile_id: Option<String>,
+    accounts: Vec<Session>,
+}
+
+enum ParsedLoginToken {
+    Bundle(PortableAccountBundle),
+    SingleSession(Session),
+    Jwt(String),
+}
+
+fn decode_base64_flexible(encoded: &str) -> Result<Vec<u8>, AppError> {
+    let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return Err(AppError::Auth("Portable login token payload is empty".to_owned()));
+    }
+    URL_SAFE_NO_PAD
+        .decode(&compact)
+        .or_else(|_| URL_SAFE.decode(&compact))
+        .or_else(|_| STANDARD.decode(&compact))
+        .map_err(|e| AppError::Auth(format!("Invalid portable login token encoding: {e}")))
+}
+
+fn encode_portable_session(session: &Session) -> Result<String, AppError> {
+    let json = serde_json::to_vec(session)
+        .map_err(|e| AppError::Auth(format!("Failed to serialize login token: {e}")))?;
+    Ok(format!("{PORTABLE_SESSION_PREFIX}{}", URL_SAFE_NO_PAD.encode(json)))
+}
+
+fn encode_portable_bundle(bundle: &PortableAccountBundle) -> Result<String, AppError> {
+    let json = serde_json::to_vec(bundle)
+        .map_err(|e| AppError::Auth(format!("Failed to serialize login token bundle: {e}")))?;
+    Ok(format!("{PORTABLE_BUNDLE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json)))
+}
+
+fn strip_auth_token_wrappers(raw: &str) -> &str {
+    let mut s = raw.trim();
+    loop {
+        let stripped = s.trim().trim_matches(|c| c == '"' || c == '\'');
+        let lower = stripped.to_ascii_lowercase();
+        let next = if lower.starts_with("authorization:") {
+            stripped["authorization:".len()..].trim()
+        } else if lower.starts_with("grindr3 ") {
+            stripped["grindr3 ".len()..].trim()
+        } else if lower.starts_with("bearer ") {
+            stripped["bearer ".len()..].trim()
+        } else if stripped.len() != s.len() {
+            stripped
+        } else {
+            return stripped;
+        };
+        if next.len() == s.len() {
+            return next;
+        }
+        s = next;
+    }
+}
+
+fn json_field_as_string(obj: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(val) = obj.get(*key) {
+            match val {
+                serde_json::Value::String(s) if !s.trim().is_empty() => {
+                    return Some(s.trim().to_owned());
+                }
+                serde_json::Value::Number(n) => return Some(n.to_string()),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn session_from_json_value(val: &serde_json::Value) -> Option<Session> {
+    if let Ok(session) = serde_json::from_value::<Session>(val.clone()) {
+        if !session.session_id.trim().is_empty() {
+            return Some(session);
+        }
+    }
+
+    let session_id = json_field_as_string(val, &["sessionId", "session_id"])?;
+    let claims = decode_session_jwt(&session_id).ok();
+    let profile_id = json_field_as_string(val, &["profileId", "profile_id"])
+        .or_else(|| claims.as_ref().map(|c| c.profile_id.clone()))?;
+    let auth_token = json_field_as_string(val, &["authToken", "auth_token"]).unwrap_or_default();
+    let email = json_field_as_string(val, &["email"]).unwrap_or_default();
+    let expires_at = val
+        .get("expiresAt")
+        .or_else(|| val.get("expires_at"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| claims.as_ref().map(|c| c.exp))
+        .unwrap_or(0);
+    let device_id = json_field_as_string(val, &["deviceId", "device_id"])
+        .unwrap_or_else(|| format!("{:016x}", rand::random::<u64>()));
+    let advertising_id = json_field_as_string(val, &["advertisingId", "advertising_id"])
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let third_party_user_id =
+        json_field_as_string(val, &["thirdPartyUserId", "third_party_user_id"]);
+
+    Some(Session {
+        email,
+        expires_at,
+        profile_id,
+        session_id,
+        auth_token,
+        device_id,
+        advertising_id,
+        third_party_user_id,
+    })
+}
+
+fn parse_login_token_payload(raw: &str) -> Result<ParsedLoginToken, AppError> {
+    let cleaned = strip_auth_token_wrappers(raw);
+    if cleaned.is_empty() {
+        return Err(AppError::Auth("Login token is empty".to_owned()));
+    }
+
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.starts_with(PORTABLE_BUNDLE_PREFIX) {
+        let bytes = decode_base64_flexible(&cleaned[PORTABLE_BUNDLE_PREFIX.len()..])?;
+        let bundle: PortableAccountBundle = serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::Auth(format!("Invalid account bundle token: {e}")))?;
+        return Ok(ParsedLoginToken::Bundle(bundle));
+    }
+
+    if lower.starts_with(PORTABLE_SESSION_PREFIX) {
+        let bytes = decode_base64_flexible(&cleaned[PORTABLE_SESSION_PREFIX.len()..])?;
+        let session: Session = serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::Auth(format!("Invalid portable login token: {e}")))?;
+        return Ok(ParsedLoginToken::SingleSession(session));
+    }
+
+    if cleaned.starts_with('{') {
+        let val: serde_json::Value = serde_json::from_str(cleaned)
+            .map_err(|e| AppError::Auth(format!("Invalid JSON login token: {e}")))?;
+        if let Ok(bundle) = serde_json::from_value::<PortableAccountBundle>(val.clone()) {
+            if !bundle.accounts.is_empty() {
+                return Ok(ParsedLoginToken::Bundle(bundle));
+            }
+        }
+        if let Some(session) = session_from_json_value(&val) {
+            return Ok(ParsedLoginToken::SingleSession(session));
+        }
+        if let Some(jwt) = json_field_as_string(&val, &["token", "jwt", "sessionId", "session_id"]) {
+            return Ok(ParsedLoginToken::Jwt(strip_auth_token_wrappers(&jwt).to_owned()));
+        }
+        return Err(AppError::Auth(
+            "JSON payload does not contain sessionId, token, or accounts".to_owned(),
+        ));
+    }
+
+    Ok(ParsedLoginToken::Jwt(cleaned.to_owned()))
 }
 
 fn extract_url_param(input: &str, key: &str) -> Option<String> {
@@ -1056,10 +1221,176 @@ impl GrindrClient {
         Ok(LoginResult { profile_id })
     }
 
+    async fn restore_imported_sessions(
+        &self,
+        sessions: Vec<Session>,
+        preferred_active_id: Option<&str>,
+    ) -> Result<LoginResult, AppError> {
+        if sessions.is_empty() {
+            return Err(AppError::Auth(
+                "Portable token bundle contains no accounts".to_owned(),
+            ));
+        }
+
+        let mut normalized = Vec::with_capacity(sessions.len());
+        for mut session in sessions {
+            let claims = decode_session_jwt(&session.session_id).ok();
+            if session.profile_id.trim().is_empty() {
+                if let Some(c) = &claims {
+                    session.profile_id = c.profile_id.clone();
+                }
+            }
+            if session.profile_id.trim().is_empty() {
+                return Err(AppError::Auth(
+                    "Imported session is missing profileId and JWT claims".to_owned(),
+                ));
+            }
+            if session.expires_at == 0 {
+                if let Some(c) = &claims {
+                    session.expires_at = c.exp;
+                }
+            }
+            if session.device_id.trim().is_empty() {
+                session.device_id = format!("{:016x}", rand::random::<u64>());
+            }
+            if session.advertising_id.trim().is_empty() {
+                session.advertising_id = uuid::Uuid::new_v4().to_string();
+            }
+            normalized.push(session);
+        }
+
+        let active_idx = preferred_active_id
+            .and_then(|target| normalized.iter().position(|s| s.profile_id == target))
+            .unwrap_or(0);
+        let active = normalized[active_idx].clone();
+
+        // Persist non-active accounts first so the active account keeps the most recent timestamp.
+        for (idx, session) in normalized.iter().enumerate() {
+            if idx != active_idx {
+                if let Err(_err) = AuthStorage::save_account(session) {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[HTTP-AUTH] Failed to save imported account {}: {}",
+                        session.profile_id, _err
+                    );
+                }
+            }
+        }
+
+        {
+            let mut device = self.device.write().await;
+            device.device_id = active.device_id.clone();
+            device.advertising_id = active.advertising_id.clone();
+        }
+
+        Self::persist_session_best_effort(&active, true);
+        *self.session.write().await = Some(active.clone());
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let can_refresh = !active.auth_token.is_empty()
+            || active
+                .third_party_user_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+        if active.expires_at > 0 && active.expires_at <= now + 60 && can_refresh {
+            if let Ok(refreshed) = self.refresh_token().await {
+                return Ok(refreshed);
+            }
+        }
+
+        Ok(LoginResult {
+            profile_id: active.profile_id,
+        })
+    }
+
+    pub async fn export_login_tokens(
+        &self,
+        profile_ids: Option<Vec<String>>,
+    ) -> Result<String, AppError> {
+        let current_session = {
+            let guard = self.session.read().await;
+            match guard.as_ref() {
+                Some(s) => Some(s.clone()),
+                None => AuthStorage::get_session().ok().flatten(),
+            }
+        };
+
+        let resolve_session = |profile_id: &str| -> Result<Option<Session>, AppError> {
+            if let Some(cur) = &current_session {
+                if cur.profile_id == profile_id {
+                    return Ok(Some(cur.clone()));
+                }
+            }
+            AuthStorage::get_account_session(profile_id)
+        };
+
+        let mut sessions: Vec<Session> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if let Some(ids) = profile_ids.filter(|v| !v.is_empty()) {
+            for id in ids {
+                if seen.insert(id.clone()) {
+                    if let Some(session) = resolve_session(&id)? {
+                        sessions.push(session);
+                    }
+                }
+            }
+        } else {
+            if let Some(cur) = &current_session {
+                if seen.insert(cur.profile_id.clone()) {
+                    sessions.push(cur.clone());
+                }
+            }
+            for meta in AuthStorage::list_saved_accounts()? {
+                if seen.insert(meta.profile_id.clone()) {
+                    if let Some(session) = resolve_session(&meta.profile_id)? {
+                        sessions.push(session);
+                    }
+                }
+            }
+        }
+
+        if sessions.is_empty() {
+            return Err(AppError::Auth(
+                "No logged-in or saved accounts found to copy".to_owned(),
+            ));
+        }
+
+        if sessions.len() == 1 {
+            return encode_portable_session(&sessions[0]);
+        }
+
+        let active_profile_id = current_session
+            .map(|s| s.profile_id)
+            .filter(|id| sessions.iter().any(|s| s.profile_id == *id));
+
+        encode_portable_bundle(&PortableAccountBundle {
+            version: 1,
+            active_profile_id,
+            accounts: sessions,
+        })
+    }
+
     pub async fn login_with_jwt(&self, token: &str) -> Result<LoginResult, AppError> {
         if extract_facebook_access_token(token).is_some() {
             return self.login_with_facebook(token).await;
         }
+
+        let token_owned = match parse_login_token_payload(token)? {
+            ParsedLoginToken::Bundle(bundle) => {
+                return self
+                    .restore_imported_sessions(
+                        bundle.accounts,
+                        bundle.active_profile_id.as_deref(),
+                    )
+                    .await;
+            }
+            ParsedLoginToken::SingleSession(session) => {
+                return self.restore_imported_sessions(vec![session], None).await;
+            }
+            ParsedLoginToken::Jwt(jwt) => jwt,
+        };
+        let token = token_owned.as_str();
 
         #[cfg(debug_assertions)]
         eprintln!(
@@ -1511,6 +1842,96 @@ pub async fn switch_account(
 #[tauri::command]
 pub async fn remove_saved_account(profile_id: String) -> Result<(), AppError> {
     AuthStorage::remove_saved_account(&profile_id)
+}
+
+#[tauri::command]
+pub async fn export_login_tokens(
+    state: tauri::State<'_, AppState>,
+    profile_ids: Option<Vec<String>>,
+) -> Result<String, AppError> {
+    state.client()?.export_login_tokens(profile_ids).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_session_and_bundle_roundtrip() {
+        let session_a = Session {
+            email: "a@example.com".to_owned(),
+            expires_at: 1_900_000_000,
+            profile_id: "111222333".to_owned(),
+            session_id: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.e30.sig".to_owned(),
+            auth_token: "auth-a".to_owned(),
+            device_id: "0123456789abcdef".to_owned(),
+            advertising_id: "11111111-1111-1111-1111-111111111111".to_owned(),
+            third_party_user_id: None,
+        };
+        let session_b = Session {
+            email: "b@example.com".to_owned(),
+            expires_at: 1_900_000_100,
+            profile_id: "444555666".to_owned(),
+            session_id: "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.e30.sigb".to_owned(),
+            auth_token: "auth-b".to_owned(),
+            device_id: "fedcba9876543210".to_owned(),
+            advertising_id: "22222222-2222-2222-2222-222222222222".to_owned(),
+            third_party_user_id: Some("fb-123".to_owned()),
+        };
+
+        let single_token = encode_portable_session(&session_a).expect("encode single session");
+        assert!(single_token.starts_with(PORTABLE_SESSION_PREFIX));
+        match parse_login_token_payload(&format!("  \"{single_token}\"  "))
+            .expect("parse single session")
+        {
+            ParsedLoginToken::SingleSession(decoded) => {
+                assert_eq!(decoded.profile_id, "111222333");
+                assert_eq!(decoded.auth_token, "auth-a");
+                assert_eq!(decoded.email, "a@example.com");
+            }
+            _ => panic!("expected SingleSession"),
+        }
+
+        let bundle_token = encode_portable_bundle(&PortableAccountBundle {
+            version: 1,
+            active_profile_id: Some("444555666".to_owned()),
+            accounts: vec![session_a, session_b],
+        })
+        .expect("encode bundle");
+        assert!(bundle_token.starts_with(PORTABLE_BUNDLE_PREFIX));
+        match parse_login_token_payload(&bundle_token).expect("parse bundle") {
+            ParsedLoginToken::Bundle(bundle) => {
+                assert_eq!(bundle.active_profile_id.as_deref(), Some("444555666"));
+                assert_eq!(bundle.accounts.len(), 2);
+                assert_eq!(
+                    bundle.accounts[1].third_party_user_id.as_deref(),
+                    Some("fb-123")
+                );
+            }
+            _ => panic!("expected Bundle"),
+        }
+    }
+
+    #[test]
+    fn parses_raw_jwt_wrappers_and_session_json() {
+        match parse_login_token_payload("Authorization: Grindr3 eyJhbGciOiJIUzI1NiJ9.abc.def")
+            .expect("parse wrapped jwt")
+        {
+            ParsedLoginToken::Jwt(jwt) => {
+                assert_eq!(jwt, "eyJhbGciOiJIUzI1NiJ9.abc.def");
+            }
+            _ => panic!("expected Jwt"),
+        }
+
+        let json = r#"{"profileId": 987654321, "sessionId": "eyJhbGciOiJIUzI1NiJ9.e30.sig", "authToken": "at-xyz"}"#;
+        match parse_login_token_payload(json).expect("parse session json") {
+            ParsedLoginToken::SingleSession(s) => {
+                assert_eq!(s.profile_id, "987654321");
+                assert_eq!(s.auth_token, "at-xyz");
+            }
+            _ => panic!("expected SingleSession"),
+        }
+    }
 }
 
 #[tauri::command]

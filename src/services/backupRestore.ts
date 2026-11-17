@@ -24,7 +24,13 @@ export const BACKUP_CATEGORY_IDS: BackupCategoryId[] = [
 ];
 
 export type BackupInspection =
-	| { ok: true; categories: BackupCategoryId[]; exportedAt: number }
+	| {
+			ok: true;
+			categories: BackupCategoryId[];
+			exportedAt: number;
+			ownerUserId?: number;
+			isDifferentOwner?: boolean;
+	  }
 	| { ok: false; error: "wrong_owner" | "invalid_format" };
 
 export type ImportBackupResult = { ok: true; rowsImported: number } | { ok: false; error: "wrong_owner" | "invalid_format" };

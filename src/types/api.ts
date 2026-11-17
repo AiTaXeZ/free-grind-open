@@ -80,6 +80,12 @@ export const methodSchemas = {
 		}),
 		response: z.undefined(),
 	},
+	export_login_tokens: {
+		request: z.object({
+			profileIds: z.array(z.string()).optional(),
+		}),
+		response: z.string(),
+	},
 } as const satisfies Record<
 	string,
 	{ request: z.ZodType; response: z.ZodType }
