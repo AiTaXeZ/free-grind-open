@@ -26,9 +26,11 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{
+    STANDARD as BASE64, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+};
 use base64::Engine as _;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -757,6 +759,23 @@ fn ensure_optional_directory_tables(conn: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
+fn decode_blob_base64(raw: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    let without_prefix = raw
+        .trim()
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,").map(|(_, body)| body))
+        .unwrap_or(raw);
+    let cleaned: String = without_prefix
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    BASE64
+        .decode(cleaned.as_bytes())
+        .or_else(|_| STANDARD_NO_PAD.decode(cleaned.as_bytes()))
+        .or_else(|_| URL_SAFE.decode(cleaned.as_bytes()))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(cleaned.as_bytes()))
+}
+
 fn export_backup_to_path<F>(
     db_path: &Path,
     owner_user_id: i64,
@@ -768,6 +787,11 @@ where
     F: FnMut(ExportProgress<'_>),
 {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+
+    if let Some(parent) = dest_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let selected_tables: Vec<&TableSpec> = EXPORT_TABLES
         .iter()
@@ -827,7 +851,7 @@ where
                         .map_err(|e| AppError::Backup(format!("failed to read {}.{col}: {e}", table.name)))?;
                     match value {
                         Some(b64_text) => {
-                            let bytes = BASE64.decode(b64_text.as_bytes()).map_err(|e| {
+                            let bytes = decode_blob_base64(&b64_text).map_err(|e| {
                                 AppError::Backup(format!("invalid base64 in {}.{col}: {e}", table.name))
                             })?;
                             let media_path = format!("media/{media_counter}.bin");
@@ -861,6 +885,23 @@ where
     Ok(())
 }
 
+fn resolve_export_dest_path(app: &AppHandle, dest_path: &str) -> Result<PathBuf, AppError> {
+    let candidate = Path::new(dest_path);
+    if candidate.is_absolute() {
+        return Ok(candidate.to_path_buf());
+    }
+    let base_dir = if cfg!(target_os = "ios") {
+        app.path()
+            .document_dir()
+            .map_err(|e| AppError::Backup(format!("failed to resolve documents dir: {e}")))?
+    } else {
+        app.path()
+            .download_dir()
+            .map_err(|e| AppError::Backup(format!("failed to resolve downloads dir: {e}")))?
+    };
+    Ok(base_dir.join(candidate))
+}
+
 #[tauri::command]
 pub fn export_backup_to_file(
     app: AppHandle,
@@ -870,7 +911,8 @@ pub fn export_backup_to_file(
     categories: Vec<String>,
 ) -> Result<(), AppError> {
     let db_path = resolve_db_path(&app, &db_file_name)?;
-    export_backup_to_path(&db_path, owner_user_id, Path::new(&dest_path), &categories, |progress| {
+    let resolved_dest = resolve_export_dest_path(&app, &dest_path)?;
+    export_backup_to_path(&db_path, owner_user_id, &resolved_dest, &categories, |progress| {
         let _ = app.emit(EXPORT_PROGRESS_EVENT, progress);
     })
 }

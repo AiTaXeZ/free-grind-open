@@ -52,7 +52,31 @@ function formatBytes(bytes: number): string {
 }
 
 function getErrorMessage(error: unknown, fallback: string): string {
-	return error instanceof Error && error.message ? error.message : fallback;
+	if (error instanceof Error && error.message) {
+		return error.message;
+	}
+	if (typeof error === "string" && error.trim()) {
+		return error.trim();
+	}
+	if (error && typeof error === "object") {
+		const record = error as {
+			prettyMessage?: unknown;
+			message?: unknown;
+		};
+		if (typeof record.prettyMessage === "string" && record.prettyMessage.trim()) {
+			return record.prettyMessage.trim();
+		}
+		if (typeof record.message === "string" && record.message.trim()) {
+			return record.message.trim();
+		}
+		if (record.message && typeof record.message === "object") {
+			const nested = (record.message as { message?: unknown }).message;
+			if (typeof nested === "string" && nested.trim()) {
+				return nested.trim();
+			}
+		}
+	}
+	return fallback;
 }
 
 export function SettingsDataPage() {
@@ -155,19 +179,15 @@ export function SettingsDataPage() {
 			return false;
 		}
 		setIsExporting(true);
-		const tempPath = await newExportTempPath();
+		let tempPath: string | null = null;
 		try {
 			const fileName = `${filePrefix}-${new Date().toISOString().slice(0, 10)}.zip`;
 
-			// The actual SQL read + base64 decode + zip compression all happen
-			// natively in Rust (src-tauri/src/commands/backup.rs) — this just
-			// writes the archive to a scratch file, which the platform-specific
-			// branches below then move to where the user can actually find it.
-			await exportBackupToFile(chatDb.getActiveChatDbFileName(), userId, tempPath, categoriesToExport);
-
 			if (isAndroid()) {
-				// The blob-URL + <a download> trick below doesn't trigger a save on
-				// Android's WebView, so write the export directly via MediaStore instead.
+				// On Android, write to an app-cache scratch zip first, then stream
+				// chunks into a pending MediaStore Download/FreeGrind entry.
+				tempPath = await newExportTempPath();
+				await exportBackupToFile(chatDb.getActiveChatDbFileName(), userId, tempPath, categoriesToExport);
 				const uri = await AndroidFs.createNewPublicFile(AndroidPublicGeneralPurposeDir.Download, `FreeGrind/${fileName}`, "application/zip", {
 					isPending: true,
 				});
@@ -192,33 +212,10 @@ export function SettingsDataPage() {
 					throw error;
 				}
 			} else {
-				// Streams straight to disk instead of loading the whole archive
-				// into memory first.
-				const generator = readFileInChunks(tempPath);
-				const readable = new ReadableStream<Uint8Array>({
-					async pull(controller) {
-						const { value, done } = await generator.next();
-						if (done) {
-							controller.close();
-						} else {
-							controller.enqueue(value);
-						}
-					},
-					async cancel() {
-						await generator.return(undefined);
-					},
-				});
-
-				// iOS has no shared Downloads folder — write into the app's own
-				// Documents dir instead, which Info.plist's UIFileSharingEnabled +
-				// LSSupportsOpeningDocumentsInPlace expose in the Files app under
-				// "On My iPhone/iPad" > Free Grind.
-				const baseDir = isIos() ? BaseDirectory.Document : BaseDirectory.Download;
-				// Must stay under <baseDir>/FreeGrind — the fs:allow-write-file
-				// capability (desktop.json / ios.json) only scopes write access to
-				// that folder, same one saveMedia.ts saves media into on desktop.
-				await mkdir("FreeGrind", { baseDir, recursive: true });
-				await writeFsFile(`FreeGrind/${fileName}`, readable, { baseDir });
+				// Desktop (Windows/macOS/Linux) and iOS resolve relative paths
+				// directly in Rust to Downloads/FreeGrind or Documents/FreeGrind,
+				// avoiding temp copies and WebView IPC streaming.
+				await exportBackupToFile(chatDb.getActiveChatDbFileName(), userId, `FreeGrind/${fileName}`, categoriesToExport);
 			}
 
 			toast.success(
@@ -230,11 +227,14 @@ export function SettingsDataPage() {
 			);
 			return true;
 		} catch (error) {
+			appLog.error("[SettingsDataPage] export failed", error);
 			toast.error(getErrorMessage(error, t("data_backup.export_failed", { defaultValue: "Failed to export data." })));
 			return false;
 		} finally {
 			setIsExporting(false);
-			await cleanupTempFile(tempPath);
+			if (tempPath) {
+				await cleanupTempFile(tempPath);
+			}
 		}
 	};
 
@@ -298,6 +298,7 @@ export function SettingsDataPage() {
 				hasDifferentOwner,
 			});
 		} catch (error) {
+			appLog.error("[SettingsDataPage] import inspection failed", error);
 			toast.error(getErrorMessage(error, t("data_backup.import_failed", { defaultValue: "Failed to import data." })));
 			await Promise.all(copiedPaths.map((p) => cleanupTempFile(p)));
 		} finally {
@@ -351,6 +352,7 @@ export function SettingsDataPage() {
 			setPendingImport(null);
 			window.location.reload();
 		} catch (error) {
+			appLog.error("[SettingsDataPage] import failed", error);
 			toast.error(getErrorMessage(error, t("data_backup.import_failed", { defaultValue: "Failed to import data." })));
 		} finally {
 			setIsImporting(false);
@@ -433,6 +435,7 @@ export function SettingsDataPage() {
 						: t("data_backup.phrases_export_success_desktop", { defaultValue: "Saved phrases exported to Downloads/FreeGrind." }),
 			);
 		} catch (error) {
+			appLog.error("[SettingsDataPage] phrases export failed", error);
 			toast.error(getErrorMessage(error, t("data_backup.phrases_export_failed", { defaultValue: "Failed to export saved phrases." })));
 		} finally {
 			setIsExportingPhrases(false);
@@ -517,6 +520,7 @@ export function SettingsDataPage() {
 						: t("data_backup.encounters_export_success_desktop", { defaultValue: "Encounters exported to Downloads/FreeGrind." }),
 			);
 		} catch (error) {
+			appLog.error("[SettingsDataPage] encounters export failed", error);
 			toast.error(getErrorMessage(error, t("data_backup.encounters_export_failed", { defaultValue: "Failed to export encounters." })));
 		} finally {
 			setIsExportingEncounters(false);

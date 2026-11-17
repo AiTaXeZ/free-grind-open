@@ -82,3 +82,11 @@
 - Modified: `src/pages/app/interest/InterestComponents.tsx`
 - Modified: `src/pages/app/gridpage/components/ProfileDetailsContent.tsx`
 - Modified: `src/pages/app/SettingsDataPage.tsx`
+
+[2026-11-18 01:24] - Task: Resolve desktop/iOS export destinations directly in Rust with WAL busy timeout & tolerant base64 decoding, and grant `fs:allow-open` / `fs:allow-write` in desktop/iOS capabilities
+- Modified: `src-tauri/src/commands/backup.rs`
+- Modified: `src-tauri/capabilities/desktop.json`
+- Modified: `src-tauri/capabilities/ios.json`
+
+[2026-11-18 01:26] - Task: Route desktop/iOS backup exports directly through Rust (`exportBackupToFile`), unwrap Tauri error objects/strings in `getErrorMessage`, and log failures via `appLog.error`
+- Modified: `src/pages/app/SettingsDataPage.tsx`

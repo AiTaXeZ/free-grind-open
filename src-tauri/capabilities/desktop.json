@@ -12,6 +12,14 @@
 		{
 			"identifier": "fs:allow-write-file",
 			"allow": [{ "path": "$DOWNLOAD/FreeGrind/**" }]
+		},
+		{
+			"identifier": "fs:allow-open",
+			"allow": [{ "path": "$DOWNLOAD/FreeGrind/**" }]
+		},
+		{
+			"identifier": "fs:allow-write",
+			"allow": [{ "path": "$DOWNLOAD/FreeGrind/**" }]
 		}
 	]
 }
