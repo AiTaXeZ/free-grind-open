@@ -19,6 +19,145 @@ pub struct Session {
     pub auth_token: String,
     pub device_id: String,
     pub advertising_id: String,
+    #[serde(default)]
+    pub third_party_user_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LegacySession {
+    email: String,
+    expires_at: u64,
+    profile_id: String,
+    session_id: String,
+    auth_token: String,
+    device_id: String,
+    advertising_id: String,
+}
+
+fn decode_session_msgpack(bytes: &[u8]) -> Result<Session, AppError> {
+    if let Ok(session) = rmp_serde::decode::from_slice::<Session>(bytes) {
+        return Ok(session);
+    }
+    let legacy: LegacySession =
+        rmp_serde::decode::from_slice(bytes).map_err(|e| AppError::Auth(e.to_string()))?;
+    Ok(Session {
+        email: legacy.email,
+        expires_at: legacy.expires_at,
+        profile_id: legacy.profile_id,
+        session_id: legacy.session_id,
+        auth_token: legacy.auth_token,
+        device_id: legacy.device_id,
+        advertising_id: legacy.advertising_id,
+        third_party_user_id: None,
+    })
+}
+
+fn extract_url_param(input: &str, key: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let fragment = trimmed.split_once('#').map(|(_, f)| f);
+    let query = trimmed
+        .split_once('?')
+        .map(|(_, q)| q.split('#').next().unwrap_or(""));
+
+    for section in [fragment, query, Some(trimmed)].into_iter().flatten() {
+        for (k, v) in url::form_urlencoded::parse(section.as_bytes()) {
+            if k == key {
+                let val = v.trim();
+                if !val.is_empty() {
+                    return Some(val.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_facebook_access_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if let Some(token) = extract_url_param(trimmed, "access_token") {
+        return Some(token);
+    }
+    if trimmed.starts_with("EAA") && !trimmed.contains(char::is_whitespace) {
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThirdPartyRequest {
+    pub third_party_vendor: u32,
+    pub third_party_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geohash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThirdPartySessionRequest {
+    pub third_party_user_id: String,
+    pub auth_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geohash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThirdPartyAuthenticationResponse {
+    pub profile_id: String,
+    pub session_id: String,
+    pub auth_token: String,
+    pub third_party_user_id: String,
+    pub third_party_user_id_to_show: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThirdPartyAuthResponse {
+    #[serde(default)]
+    pub registered: Option<bool>,
+    pub profile_id: Option<String>,
+    pub authentication_response: Option<ThirdPartyAuthenticationResponse>,
+    pub third_party_user_info: Option<serde_json::Value>,
+    pub session_id: Option<String>,
+    pub auth_token: Option<String>,
+    pub third_party_user_id: Option<String>,
+    pub third_party_user_id_to_show: Option<String>,
+}
+
+impl ThirdPartyAuthResponse {
+    fn into_auth_response(
+        self,
+        fallback_tp_user_id: Option<String>,
+    ) -> Result<ThirdPartyAuthenticationResponse, AppError> {
+        if self.registered == Some(false) {
+            return Err(AppError::Auth(
+                "No Grindr account is linked to this Facebook account. Please register first."
+                    .to_owned(),
+            ));
+        }
+        if let Some(auth_resp) = self.authentication_response {
+            return Ok(auth_resp);
+        }
+        if let (Some(profile_id), Some(session_id), Some(auth_token)) =
+            (self.profile_id, self.session_id, self.auth_token)
+        {
+            let third_party_user_id = self
+                .third_party_user_id
+                .or(fallback_tp_user_id)
+                .unwrap_or_default();
+            return Ok(ThirdPartyAuthenticationResponse {
+                profile_id,
+                session_id,
+                auth_token,
+                third_party_user_id,
+                third_party_user_id_to_show: self.third_party_user_id_to_show,
+            });
+        }
+        Err(AppError::Auth(
+            "Missing authentication response from Grindr".to_owned(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,9 +275,7 @@ impl AuthStorage {
             }
         };
 
-        rmp_serde::decode::from_slice(&session_bytes)
-            .map_err(|e| AppError::Auth(e.to_string()))
-            .map(Some)
+        decode_session_msgpack(&session_bytes).map(Some)
     }
 
     #[cfg(target_os = "windows")]
@@ -207,9 +344,7 @@ impl AuthStorage {
             }
         };
 
-        rmp_serde::decode::from_slice(&session_bytes)
-            .map_err(|e| AppError::Auth(e.to_string()))
-            .map(Some)
+        decode_session_msgpack(&session_bytes).map(Some)
     }
 
     #[cfg(all(target_os = "macos", debug_assertions))]
@@ -282,9 +417,7 @@ impl AuthStorage {
             }
         };
 
-        rmp_serde::decode::from_slice(&session_bytes)
-            .map_err(|e| AppError::Auth(e.to_string()))
-            .map(Some)
+        decode_session_msgpack(&session_bytes).map(Some)
     }
 
     #[cfg(all(target_os = "macos", not(debug_assertions)))]
@@ -383,9 +516,7 @@ impl AuthStorage {
                 }
             }
         };
-        rmp_serde::decode::from_slice(&session_bytes)
-            .map_err(|e| AppError::Auth(e.to_string()))
-            .map(Some)
+        decode_session_msgpack(&session_bytes).map(Some)
     }
 
     #[cfg(not(any(target_os = "windows", all(target_os = "macos", debug_assertions))))]
@@ -716,9 +847,7 @@ impl AuthStorage {
     pub fn get_account_session(profile_id: &str) -> Result<Option<Session>, AppError> {
         let slot = account_session_slot(profile_id);
         match Self::get_slot_bytes(&slot)? {
-            Some(bytes) => rmp_serde::decode::from_slice::<Session>(&bytes)
-                .map(Some)
-                .map_err(|e| AppError::Auth(e.to_string())),
+            Some(bytes) => decode_session_msgpack(&bytes).map(Some),
             None => Ok(None),
         }
     }
@@ -774,6 +903,7 @@ impl GrindrClient {
             expires_at: claims.exp,
             device_id,
             advertising_id,
+            third_party_user_id: None,
         };
 
         #[cfg(debug_assertions)]
@@ -781,22 +911,115 @@ impl GrindrClient {
             "[HTTP-AUTH] Saving session to storage; profile_id={}, expires_at={}",
             session.profile_id, session.expires_at
         );
-        if let Err(_error) = AuthStorage::set_session(&session) {
+        Self::persist_session_best_effort(&session, true);
+
+        Ok(session)
+    }
+
+    fn persist_session_best_effort(session: &Session, save_account: bool) {
+        if let Err(_error) = AuthStorage::set_session(session) {
             #[cfg(debug_assertions)]
             eprintln!(
                 "[HTTP-AUTH] Failed to persist session (continuing in-memory only): {}",
                 _error
             );
         }
-        if let Err(_error) = AuthStorage::save_account(&session) {
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[HTTP-AUTH] Failed to register account in switcher (login still succeeded): {}",
-                _error
-            );
+        if save_account {
+            if let Err(_error) = AuthStorage::save_account(session) {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[HTTP-AUTH] Failed to register account in switcher (login still succeeded): {}",
+                    _error
+                );
+            }
+        }
+    }
+
+    pub async fn login_with_facebook(
+        &self,
+        facebook_access_token: &str,
+    ) -> Result<LoginResult, AppError> {
+        let token = extract_facebook_access_token(facebook_access_token)
+            .unwrap_or_else(|| facebook_access_token.trim().to_owned());
+        if token.is_empty() {
+            return Err(AppError::Auth("Facebook access token is empty".to_owned()));
         }
 
-        Ok(session)
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[HTTP-AUTH] login_with_facebook attempt; token_len={}",
+            token.len()
+        );
+
+        let new_device_id = format!("{:016x}", rand::random::<u64>());
+        let new_advertising_id = uuid::Uuid::new_v4().to_string();
+
+        {
+            let mut device = self.device.write().await;
+            device.device_id = new_device_id.clone();
+            device.advertising_id = new_advertising_id.clone();
+        }
+
+        // Clear any stale Authorization header before initial third-party token exchange.
+        let previous_session = self.session.write().await.take();
+
+        let body = ThirdPartyRequest {
+            third_party_vendor: 1,
+            third_party_token: token,
+            geohash: None,
+        };
+
+        let response: ThirdPartyAuthResponse = match self
+            .request_json(Method::POST, "/v8/sessions/thirdparty", Some(&body))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                *self.session.write().await = previous_session;
+                return Err(err);
+            }
+        };
+
+        let auth_resp = match response.into_auth_response(None) {
+            Ok(resp) => resp,
+            Err(err) => {
+                *self.session.write().await = previous_session;
+                return Err(err);
+            }
+        };
+
+        let claims = match decode_session_jwt(&auth_resp.session_id) {
+            Ok(claims) => claims,
+            Err(err) => {
+                *self.session.write().await = previous_session;
+                return Err(err);
+            }
+        };
+
+        let session = Session {
+            email: auth_resp
+                .third_party_user_id_to_show
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| auth_resp.third_party_user_id.clone()),
+            profile_id: auth_resp.profile_id.clone(),
+            session_id: auth_resp.session_id,
+            auth_token: auth_resp.auth_token,
+            expires_at: claims.exp,
+            device_id: new_device_id,
+            advertising_id: new_advertising_id,
+            third_party_user_id: (!auth_resp.third_party_user_id.is_empty())
+                .then_some(auth_resp.third_party_user_id),
+        };
+
+        Self::persist_session_best_effort(&session, true);
+
+        let profile_id = session.profile_id.clone();
+        *self.session.write().await = Some(session);
+
+        #[cfg(debug_assertions)]
+        eprintln!("[HTTP-AUTH] login_with_facebook succeeded; profile_id={profile_id}");
+
+        Ok(LoginResult { profile_id })
     }
 
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginResult, AppError> {
@@ -834,6 +1057,10 @@ impl GrindrClient {
     }
 
     pub async fn login_with_jwt(&self, token: &str) -> Result<LoginResult, AppError> {
+        if extract_facebook_access_token(token).is_some() {
+            return self.login_with_facebook(token).await;
+        }
+
         #[cfg(debug_assertions)]
         eprintln!(
             "[HTTP-AUTH] login_with_jwt attempt; token_len={}",
@@ -864,6 +1091,7 @@ impl GrindrClient {
             expires_at: claims.exp,
             device_id: new_device_id.clone(),
             advertising_id: new_advertising_id.clone(),
+            third_party_user_id: None,
         });
 
         // Try to exchange the JWT for a full session (sessionId + authToken) so that
@@ -886,20 +1114,7 @@ impl GrindrClient {
                     !session.auth_token.is_empty()
                 );
                 let profile_id = session.profile_id.clone();
-                if let Err(_error) = AuthStorage::set_session(&session) {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[HTTP-AUTH] Failed to persist exchanged session (continuing in-memory only): {}",
-                        _error
-                    );
-                }
-                if let Err(_error) = AuthStorage::save_account(&session) {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[HTTP-AUTH] Failed to register account in switcher (login still succeeded): {}",
-                        _error
-                    );
-                }
+                Self::persist_session_best_effort(&session, true);
                 *self.session.write().await = Some(session);
                 Ok(LoginResult { profile_id })
             }
@@ -922,14 +1137,9 @@ impl GrindrClient {
                     expires_at: claims.exp,
                     device_id: new_device_id,
                     advertising_id: new_advertising_id,
+                    third_party_user_id: None,
                 };
-                if let Err(_error) = AuthStorage::set_session(&session) {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[HTTP-AUTH] Failed to persist JWT session (continuing in-memory only): {}",
-                        _error
-                    );
-                }
+                Self::persist_session_best_effort(&session, false);
                 *self.session.write().await = Some(session);
                 #[cfg(debug_assertions)]
                 eprintln!(
@@ -948,6 +1158,54 @@ impl GrindrClient {
         let session = current
             .as_ref()
             .ok_or_else(|| AppError::Auth("Not logged in".to_owned()))?;
+
+        // Third-party accounts (e.g. Facebook) refresh directly via /v8/sessions/thirdparty
+        // using their rolling authToken and thirdPartyUserId without re-prompting OAuth.
+        if let Some(tp_user_id) = session
+            .third_party_user_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            if !session.auth_token.is_empty() {
+                let tp_user_id = tp_user_id.to_owned();
+                let body = ThirdPartySessionRequest {
+                    third_party_user_id: tp_user_id.clone(),
+                    auth_token: session.auth_token.clone(),
+                    geohash: None,
+                };
+                let device_id = session.device_id.clone();
+                let advertising_id = session.advertising_id.clone();
+                let email = session.email.clone();
+                drop(current);
+
+                let response: ThirdPartyAuthResponse = self
+                    .request_json(Method::POST, "/v8/sessions/thirdparty", Some(&body))
+                    .await?;
+                let auth_resp = response.into_auth_response(Some(tp_user_id))?;
+                let claims = decode_session_jwt(&auth_resp.session_id)?;
+
+                let new_session = Session {
+                    email: auth_resp
+                        .third_party_user_id_to_show
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(email),
+                    profile_id: auth_resp.profile_id.clone(),
+                    session_id: auth_resp.session_id,
+                    auth_token: auth_resp.auth_token,
+                    expires_at: claims.exp,
+                    device_id,
+                    advertising_id,
+                    third_party_user_id: (!auth_resp.third_party_user_id.is_empty())
+                        .then_some(auth_resp.third_party_user_id),
+                };
+
+                Self::persist_session_best_effort(&new_session, true);
+                let profile_id = new_session.profile_id.clone();
+                *self.session.write().await = Some(new_session);
+
+                return Ok(LoginResult { profile_id });
+            }
+        }
 
         // JWT-only fallback sessions (see login_with_jwt) have no real authToken to
         // refresh with — they just resend their own session_id (the original
@@ -1093,6 +1351,121 @@ pub async fn login_with_jwt(
     token: String,
 ) -> Result<LoginResult, AppError> {
     state.client()?.login_with_jwt(&token).await
+}
+
+#[tauri::command]
+pub async fn login_with_facebook(
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<LoginResult, AppError> {
+    state.client()?.login_with_facebook(&token).await
+}
+
+#[cfg(not(mobile))]
+fn handle_facebook_oauth_url(
+    url_str: &str,
+    tx: &std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>,
+) -> bool {
+    if !url_str.contains("login_success.html") && !url_str.starts_with("fb1273378622718674://") {
+        return false;
+    }
+
+    if let Some(token) = extract_facebook_access_token(url_str) {
+        if let Ok(mut lock) = tx.lock() {
+            if let Some(sender) = lock.take() {
+                let _ = sender.send(Ok(token));
+            }
+        }
+        return true;
+    }
+
+    if let Some(err_msg) = extract_url_param(url_str, "error_description")
+        .or_else(|| extract_url_param(url_str, "error"))
+    {
+        if let Ok(mut lock) = tx.lock() {
+            if let Some(sender) = lock.take() {
+                let _ = sender.send(Err(err_msg));
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
+#[tauri::command]
+pub async fn start_facebook_oauth_flow(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<LoginResult, AppError> {
+    #[cfg(not(mobile))]
+    {
+        use std::sync::{Arc, Mutex};
+        use tauri::{Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+        if let Some(existing) = app.get_webview_window("facebook_oauth") {
+            let _ = existing.close();
+        }
+
+        let oauth_url = "https://www.facebook.com/v16.0/dialog/oauth?\
+            client_id=1273378622718674\
+            &redirect_uri=https://www.facebook.com/connect/login_success.html\
+            &response_type=token,signed_request\
+            &scope=public_profile,email\
+            &auth_type=rerequest";
+
+        let parsed_url: tauri::Url = oauth_url
+            .parse()
+            .map_err(|e| AppError::Auth(format!("Invalid Facebook OAuth URL: {e}")))?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+
+        let tx_nav = Arc::clone(&tx);
+        let tx_load = Arc::clone(&tx);
+        let win = WebviewWindowBuilder::new(
+            &app,
+            "facebook_oauth",
+            WebviewUrl::External(parsed_url),
+        )
+        .title("Continue with Facebook")
+        .inner_size(520.0, 680.0)
+        .resizable(true)
+        .on_navigation(move |url| !handle_facebook_oauth_url(url.as_str(), &tx_nav))
+        .on_page_load(move |_win, payload| {
+            let _ = handle_facebook_oauth_url(payload.url().as_str(), &tx_load);
+        })
+        .build()
+        .map_err(|e| AppError::Auth(format!("Failed to open Facebook login window: {e}")))?;
+
+        let tx_close = Arc::clone(&tx);
+        win.on_window_event(move |event| {
+            if matches!(event, WindowEvent::Destroyed) {
+                if let Ok(mut lock) = tx_close.lock() {
+                    if let Some(sender) = lock.take() {
+                        let _ = sender.send(Err("Facebook login cancelled".to_owned()));
+                    }
+                }
+            }
+        });
+
+        let oauth_result = rx.await;
+        if let Some(w) = app.get_webview_window("facebook_oauth") {
+            let _ = w.close();
+        }
+
+        let token = oauth_result
+            .map_err(|_| AppError::Auth("Facebook login cancelled".to_owned()))?
+            .map_err(AppError::Auth)?;
+
+        state.client()?.login_with_facebook(&token).await
+    }
+
+    #[cfg(mobile)]
+    {
+        let _ = (app, state);
+        Err(AppError::Auth("Mobile uses native OAuth bridge".to_owned()))
+    }
 }
 
 #[tauri::command]

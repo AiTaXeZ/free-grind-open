@@ -1,7 +1,7 @@
 name: Build Windows and Android
 
 on:
-  #push:
+  push:
     branches:
       - development
   workflow_dispatch:

@@ -1,3 +1,4 @@
+import AuthenticationServices
 import SwiftRs
 import Tauri
 import UIKit
@@ -55,12 +56,15 @@ extension WKWebView {
     }
 }
 
-class KeyboardFixPlugin: Plugin {
+class KeyboardFixPlugin: Plugin, WKScriptMessageHandler, ASWebAuthenticationPresentationContextProviding {
     private var keyboardObserver: NSObjectProtocol?
     private weak var patchedWebView: WKWebView?
+    private var authSession: ASWebAuthenticationSession?
 
     @objc public override func load(webview: WKWebView) {
         patchedWebView = webview
+        webview.configuration.userContentController.removeScriptMessageHandler(forName: "freeGrindFacebookOAuth")
+        webview.configuration.userContentController.add(self, name: "freeGrindFacebookOAuth")
 
         keyboardObserver = NotificationCenter.default.addObserver(
             forName: UIResponder.keyboardWillShowNotification,
@@ -75,10 +79,117 @@ class KeyboardFixPlugin: Plugin {
         }
     }
 
+    public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return patchedWebView?.window ?? UIWindow()
+    }
+
+    public func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "freeGrindFacebookOAuth" else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.startFacebookOAuth()
+        }
+    }
+
+    private func startFacebookOAuth() {
+        authSession?.cancel()
+        authSession = nil
+
+        let oauthURLString =
+            "https://m.facebook.com/v16.0/dialog/oauth?"
+            + "client_id=1273378622718674"
+            + "&redirect_uri=fb1273378622718674://authorize/"
+            + "&response_type=token,signed_request,graph_domain"
+            + "&scope=public_profile,email"
+            + "&auth_type=rerequest"
+
+        guard let url = URL(string: oauthURLString) else {
+            dispatchFacebookOAuthResult(token: nil, error: "Invalid Facebook OAuth URL")
+            return
+        }
+
+        let session = ASWebAuthenticationSession(
+            url: url,
+            callbackURLScheme: "fb1273378622718674"
+        ) { [weak self] callbackURL, error in
+            DispatchQueue.main.async {
+                self?.authSession = nil
+                if let callbackURL = callbackURL {
+                    if let token = self?.extractParam(from: callbackURL, key: "access_token") {
+                        self?.dispatchFacebookOAuthResult(token: token, error: nil)
+                        return
+                    }
+                    if let err = self?.extractParam(from: callbackURL, key: "error_description")
+                        ?? self?.extractParam(from: callbackURL, key: "error")
+                    {
+                        self?.dispatchFacebookOAuthResult(token: nil, error: err)
+                        return
+                    }
+                    self?.dispatchFacebookOAuthResult(
+                        token: nil,
+                        error: "Missing access_token in Facebook callback"
+                    )
+                    return
+                }
+
+                let nsError = error as NSError?
+                if nsError?.domain == ASWebAuthenticationSessionErrorDomain,
+                   nsError?.code == ASWebAuthenticationSessionError.canceledLogin.rawValue
+                {
+                    self?.dispatchFacebookOAuthResult(token: nil, error: "Facebook login cancelled")
+                } else {
+                    self?.dispatchFacebookOAuthResult(
+                        token: nil,
+                        error: error?.localizedDescription ?? "Facebook login failed"
+                    )
+                }
+            }
+        }
+        session.presentationContextProvider = self
+        session.prefersEphemeralWebBrowserSession = false
+        authSession = session
+
+        if !session.start() {
+            authSession = nil
+            dispatchFacebookOAuthResult(token: nil, error: "Failed to start Facebook login session")
+        }
+    }
+
+    private func extractParam(from url: URL, key: String) -> String? {
+        if let fragment = url.fragment,
+           let items = URLComponents(string: "https://dummy?\(fragment)")?.queryItems,
+           let value = items.first(where: { $0.name == key })?.value,
+           !value.isEmpty
+        {
+            return value
+        }
+        if let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+           let value = items.first(where: { $0.name == key })?.value,
+           !value.isEmpty
+        {
+            return value
+        }
+        return nil
+    }
+
+    private func dispatchFacebookOAuthResult(token: String?, error: String?) {
+        var payload: [String: String] = [:]
+        if let token = token { payload["token"] = token }
+        if let error = error { payload["error"] = error }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        let js = "window.dispatchEvent(new CustomEvent('fg:facebook-oauth', { detail: \(json) }));"
+        patchedWebView?.evaluateJavaScript(js, completionHandler: nil)
+    }
+
     deinit {
         if let keyboardObserver = keyboardObserver {
             NotificationCenter.default.removeObserver(keyboardObserver)
         }
+        authSession?.cancel()
     }
 }
 

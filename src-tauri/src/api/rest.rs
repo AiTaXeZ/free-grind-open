@@ -63,7 +63,7 @@ impl GrindrClient {
         TReq: Serialize + ?Sized,
         TResp: DeserializeOwned,
     {
-        let is_auth_path = path == "/v8/sessions" || path.starts_with("/public/");
+        let is_auth_path = path.starts_with("/v8/sessions") || path.starts_with("/public/");
         let url = if path.starts_with("http") {
             path.to_owned()
         } else {
@@ -167,7 +167,7 @@ impl GrindrClient {
         body: Option<Vec<u8>>,
         content_type: Option<&str>,
     ) -> Result<RawResponse, AppError> {
-        let is_auth_path = path == "/v8/sessions" || path.starts_with("/public/");
+        let is_auth_path = path.starts_with("/v8/sessions") || path.starts_with("/public/");
         let url = if path.starts_with("http") {
             path.to_owned()
         } else {

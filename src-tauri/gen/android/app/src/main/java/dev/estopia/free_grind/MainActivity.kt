@@ -1,6 +1,7 @@
 package dev.estopia.free_grind
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.animation.Animator
 import android.animation.ObjectAnimator
 import android.app.Dialog
@@ -9,7 +10,9 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.Uri
 import android.os.Handler
 import android.os.Build
 import android.os.Bundle
@@ -19,10 +22,15 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.animation.LinearInterpolator
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import android.widget.ImageView
 import androidx.activity.enableEdgeToEdge
 import androidx.core.content.ContextCompat
@@ -124,6 +132,8 @@ class MainActivity : TauriActivity() {
   private var webViewRef: WebView? = null
   private var pendingFcmToken: String? = null
   private var latestFcmToken: String? = null
+  private var pendingFacebookOAuthPayload: String? = null
+  private var facebookOAuthDialog: Dialog? = null
   private val mainHandler = Handler(Looper.getMainLooper())
   // Bounded pool prevents Binder-thread exhaustion when many WebSocket messages
   // arrive simultaneously and each postLocalNotification spawns avatar+IPC work.
@@ -235,6 +245,10 @@ class MainActivity : TauriActivity() {
       pendingFcmToken = null
     }
     dispatchPendingPushNotifications()
+    pendingFacebookOAuthPayload?.let { payload ->
+      pendingFacebookOAuthPayload = null
+      dispatchFacebookOAuthPayloadToWebview(payload, 0)
+    }
     handleNotificationIntent(intent)
   }
 
@@ -284,6 +298,10 @@ class MainActivity : TauriActivity() {
       }
     }
     dispatchPendingPushNotifications()
+    pendingFacebookOAuthPayload?.let { payload ->
+      pendingFacebookOAuthPayload = null
+      dispatchFacebookOAuthPayloadToWebview(payload, 0)
+    }
     handleNotificationIntent(intent)
   }
 
@@ -432,6 +450,13 @@ class MainActivity : TauriActivity() {
     @JavascriptInterface
     fun getAppDisguise(): String {
       return AppDisguise.currentDisguise(this@MainActivity).id
+    }
+
+    @JavascriptInterface
+    fun startFacebookOAuth() {
+      runOnUiThread {
+        openFacebookOAuthDialog()
+      }
     }
 
     @JavascriptInterface
@@ -586,6 +611,14 @@ class MainActivity : TauriActivity() {
 
   private fun handleNotificationIntent(intent: Intent?) {
     if (intent == null) {
+      return
+    }
+
+    val dataUri = intent.data
+    if (dataUri != null && dataUri.scheme == "fb1273378622718674") {
+      val fullUrl = dataUri.toString()
+      intent.data = null
+      handleFacebookOAuthCallbackUrl(fullUrl)
       return
     }
 
@@ -746,6 +779,181 @@ class MainActivity : TauriActivity() {
         if (shouldRetry && attempt < 12) {
           mainHandler.postDelayed({
             dispatchPushNotificationToWebview(payloadJson, attempt + 1)
+          }, 400)
+        }
+      }
+    }
+  }
+
+  private fun extractFacebookParam(url: String, key: String): String? {
+    val sections = listOfNotNull(
+      url.substringAfter('#', "").takeIf { it.isNotEmpty() },
+      url.substringAfter('?', "").substringBefore('#').takeIf { it.isNotEmpty() },
+    )
+    for (section in sections) {
+      for (pair in section.split('&')) {
+        val k = pair.substringBefore('=', "")
+        if (k == key) {
+          val rawVal = pair.substringAfter('=', "")
+          val decoded = try {
+            URLDecoder.decode(rawVal, StandardCharsets.UTF_8.name()).trim()
+          } catch (_: Exception) {
+            rawVal.trim()
+          }
+          if (decoded.isNotEmpty()) {
+            return decoded
+          }
+        }
+      }
+    }
+    return null
+  }
+
+  private fun handleFacebookOAuthCallbackUrl(url: String): Boolean {
+    if (!url.contains("login_success.html") && !url.startsWith("fb1273378622718674://")) {
+      return false
+    }
+
+    val token = extractFacebookParam(url, "access_token")
+    if (token != null) {
+      dismissFacebookOAuthDialog()
+      dispatchFacebookOAuthResult(token = token, error = null)
+      return true
+    }
+
+    val err = extractFacebookParam(url, "error_description")
+      ?: extractFacebookParam(url, "error")
+    if (err != null) {
+      dismissFacebookOAuthDialog()
+      dispatchFacebookOAuthResult(token = null, error = err)
+      return true
+    }
+
+    return false
+  }
+
+  private fun dismissFacebookOAuthDialog() {
+    facebookOAuthDialog?.dismiss()
+    facebookOAuthDialog = null
+  }
+
+  @SuppressLint("SetJavaScriptEnabled")
+  private fun openFacebookOAuthDialog() {
+    dismissFacebookOAuthDialog()
+
+    var completed = false
+    val oauthUrl =
+      "https://m.facebook.com/v16.0/dialog/oauth?" +
+        "client_id=1273378622718674" +
+        "&redirect_uri=https%3A%2F%2Fwww.facebook.com%2Fconnect%2Flogin_success.html" +
+        "&response_type=token,signed_request" +
+        "&scope=public_profile,email" +
+        "&auth_type=rerequest"
+
+    val dialog = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+    val container = FrameLayout(this)
+    val oauthWebView = WebView(this).apply {
+      layoutParams = FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.MATCH_PARENT,
+      )
+      settings.javaScriptEnabled = true
+      settings.domStorageEnabled = true
+      settings.userAgentString = settings.userAgentString.replace("; wv", "")
+      CookieManager.getInstance().setAcceptCookie(true)
+      CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+      webViewClient = object : WebViewClient() {
+        private fun maybeHandle(url: String?): Boolean {
+          if (completed || url.isNullOrBlank()) {
+            return false
+          }
+          if (handleFacebookOAuthCallbackUrl(url)) {
+            completed = true
+            return true
+          }
+          return false
+        }
+
+        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+          val url = request?.url?.toString()
+          if (maybeHandle(url)) {
+            return true
+          }
+          if (url != null && url.startsWith("fb1273378622718674://")) {
+            return true
+          }
+          return false
+        }
+
+        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+          super.onPageStarted(view, url, favicon)
+          maybeHandle(url)
+        }
+
+        override fun onPageFinished(view: WebView?, url: String?) {
+          super.onPageFinished(view, url)
+          maybeHandle(url)
+        }
+      }
+      loadUrl(oauthUrl)
+    }
+
+    container.addView(oauthWebView)
+    dialog.setContentView(container)
+    dialog.window?.let { win ->
+      win.setLayout(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+      )
+      WindowCompat.setDecorFitsSystemWindows(win, true)
+    }
+    dialog.setOnCancelListener {
+      if (!completed) {
+        completed = true
+        dispatchFacebookOAuthResult(token = null, error = "Facebook login cancelled")
+      }
+    }
+    dialog.setOnDismissListener {
+      oauthWebView.stopLoading()
+      oauthWebView.destroy()
+      if (facebookOAuthDialog === dialog) {
+        facebookOAuthDialog = null
+      }
+    }
+
+    facebookOAuthDialog = dialog
+    dialog.show()
+  }
+
+  private fun dispatchFacebookOAuthResult(token: String?, error: String?) {
+    val payload = JSONObject().apply {
+      if (token != null) put("token", token)
+      if (error != null) put("error", error)
+    }.toString()
+    dispatchFacebookOAuthPayloadToWebview(payload, 0)
+  }
+
+  private fun dispatchFacebookOAuthPayloadToWebview(payloadJson: String, attempt: Int) {
+    val script =
+      "(function(){" +
+      "var detail = $payloadJson;" +
+      "var href = String(location && location.href || '');" +
+      "if (href.indexOf('tauri.localhost') === -1) { return 'retry:not-ready:' + href; }" +
+      "window.dispatchEvent(new CustomEvent('fg:facebook-oauth', { detail: detail }));" +
+      "return 'ok';" +
+      "})();"
+
+    runOnUiThread {
+      val webView = webViewRef
+      if (webView == null) {
+        pendingFacebookOAuthPayload = payloadJson
+        return@runOnUiThread
+      }
+
+      webView.evaluateJavascript(script) { result ->
+        if (result != null && result.contains("retry") && attempt < 12) {
+          mainHandler.postDelayed({
+            dispatchFacebookOAuthPayloadToWebview(payloadJson, attempt + 1)
           }, 400)
         }
       }

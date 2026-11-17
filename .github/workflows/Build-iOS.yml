@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - development
   workflow_dispatch:
 
 permissions:
@@ -38,10 +39,13 @@ jobs:
         run: |
           rm -rf src-tauri/gen/apple
           bunx tauri ios init --ci
+          if [ -f src-tauri/gen/apple/free-grind_iOS/Info.plist ]; then
+            /usr/libexec/PlistBuddy -c "Merge src-tauri/Info.plist" src-tauri/gen/apple/free-grind_iOS/Info.plist
+          fi
 
       - name: Build iOS Rust static library
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios --release
+          cargo build --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios --release --features custom-protocol
 
           LIB_PATH="src-tauri/target/aarch64-apple-ios/release/libopen_grind_lib.a"
           if [ ! -f "$LIB_PATH" ]; then

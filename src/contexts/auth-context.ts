@@ -30,6 +30,7 @@ export interface SavedAccountMeta {
 export interface AuthContextType extends AuthState {
 	login: (email: string, password: string) => Promise<void>;
 	loginWithJwt: (token: string) => Promise<void>;
+	loginWithFacebook: () => Promise<void>;
 	logout: () => Promise<void>;
 	checkAuth: () => Promise<void>;
 	savedAccounts: SavedAccountMeta[];

@@ -105,8 +105,9 @@ export function SignInPage() {
 
 	const [jwtToken, setJwtToken] = useState("");
 	const [isTokenLoading, setIsTokenLoading] = useState(false);
+	const [isFacebookLoading, setIsFacebookLoading] = useState(false);
 
-	const { login, loginWithJwt, error } = useAuth();
+	const { login, loginWithJwt, loginWithFacebook, error } = useAuth();
 	const navigate = useNavigate();
 
 	const isPasswordFormValid = email.trim().length > 0 && password.trim().length > 0;
@@ -135,6 +136,18 @@ export function SignInPage() {
 			// AuthContext updates `error`, which is rendered in the form.
 		} finally {
 			setIsTokenLoading(false);
+		}
+	};
+
+	const handleFacebookLogin = async () => {
+		setIsFacebookLoading(true);
+		try {
+			await loginWithFacebook();
+			navigate("/");
+		} catch {
+			// AuthContext updates `error`, which is rendered in the form.
+		} finally {
+			setIsFacebookLoading(false);
 		}
 	};
 
@@ -169,6 +182,31 @@ export function SignInPage() {
 				)
 			}
 		>
+			{/* Third-party OAuth */}
+			<div className="mb-4">
+				<Button
+					type="button"
+					variant="secondary"
+					loading={isFacebookLoading}
+					disabled={isPasswordLoading || isTokenLoading || isFacebookLoading}
+					onClick={() => void handleFacebookLogin()}
+					className="flex w-full items-center justify-center gap-2 border-transparent bg-[#1877F2] text-white hover:bg-[#166fe5]"
+				>
+					<svg
+						className="h-4 w-4 shrink-0 fill-current"
+						viewBox="0 0 24 24"
+						aria-hidden="true"
+					>
+						<path d="M22.675 0h-21.35c-.732 0-1.325.593-1.325 1.325v21.351c0 .731.593 1.324 1.325 1.324h11.495v-9.294h-3.128v-3.622h3.128v-2.671c0-3.1 1.893-4.788 4.659-4.788 1.325 0 2.463.099 2.795.143v3.24l-1.918.001c-1.504 0-1.795.715-1.795 1.763v2.313h3.587l-.467 3.622h-3.12v9.293h6.116c.73 0 1.323-.593 1.323-1.325v-21.35c0-.732-.593-1.325-1.325-1.325z" />
+					</svg>
+					<span>
+						{t("auth.sign_in.continue_with_facebook", {
+							defaultValue: "Continue with Facebook",
+						})}
+					</span>
+				</Button>
+			</div>
+
 			{/* Method selector */}
 			<div className="mb-6 flex gap-1 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface-2)] p-1 shadow-sm">
 				<AuthMethodTab

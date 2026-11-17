@@ -50,6 +50,9 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
         CFBundleShortVersionString: 0.5.2
         CFBundleVersion: "0.5.2"
+        CFBundleURLTypes:
+          - CFBundleURLSchemes:
+              - fb1273378622718674
         # App disguise (stealth mode, mirrors the Android activity-alias
         # feature): alternate icon sets the JS side can switch to at runtime
         # via UIApplication.setAlternateIconName (see ios-app-disguise

@@ -18,5 +18,14 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>fb1273378622718674</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

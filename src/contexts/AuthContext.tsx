@@ -197,6 +197,89 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		}
 	};
 
+	const waitForNativeFacebookToken = () =>
+		new Promise<string>((resolve, reject) => {
+			let settled = false;
+			const cleanup = () => {
+				window.removeEventListener("fg:facebook-oauth", onResult as EventListener);
+				window.clearTimeout(timeoutId);
+			};
+			const onResult = (event: Event) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				const detail = (event as CustomEvent<{ token?: string; error?: string }>).detail;
+				if (detail?.token) {
+					resolve(detail.token);
+					return;
+				}
+				reject(new Error(detail?.error || "Facebook login cancelled"));
+			};
+			const timeoutId = window.setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(new Error("Facebook login timed out"));
+			}, 180_000);
+
+			window.addEventListener("fg:facebook-oauth", onResult as EventListener);
+		});
+
+	const loginWithFacebook = async () => {
+		try {
+			appLog.info("[Auth] loginWithFacebook: attempting Facebook login");
+			dispatch({ type: "SET_LOADING", payload: true });
+			dispatch({ type: "SET_ERROR", payload: null });
+
+			const nativeWindow = window as Window & {
+				FreeGrindBridge?: { startFacebookOAuth?: () => void };
+				webkit?: {
+					messageHandlers?: {
+						freeGrindFacebookOAuth?: { postMessage: (body: unknown) => void };
+					};
+				};
+			};
+
+			let result: { profileId: number };
+			if (typeof nativeWindow.FreeGrindBridge?.startFacebookOAuth === "function") {
+				const tokenPromise = waitForNativeFacebookToken();
+				nativeWindow.FreeGrindBridge.startFacebookOAuth();
+				const token = await tokenPromise;
+				result = await callMethod("login_with_facebook", { token });
+			} else if (
+				typeof nativeWindow.webkit?.messageHandlers?.freeGrindFacebookOAuth?.postMessage ===
+				"function"
+			) {
+				const tokenPromise = waitForNativeFacebookToken();
+				nativeWindow.webkit.messageHandlers.freeGrindFacebookOAuth.postMessage("start");
+				const token = await tokenPromise;
+				result = await callMethod("login_with_facebook", { token });
+			} else {
+				result = await callMethod("start_facebook_oauth_flow");
+			}
+
+			appLog.info("[Auth] loginWithFacebook: succeeded");
+			dispatch({ type: "SET_USER", payload: result.profileId });
+			void refreshSavedAccounts();
+			toast.success("Facebook login successful");
+		} catch (error) {
+			const appError = asAppError(error);
+			const fallbackMessage =
+				error instanceof Error && error.message ? error.message : "Facebook login failed";
+			const message = describeLoginError(
+				appError,
+				fallbackMessage,
+				"Facebook login could not be completed. Please try again.",
+			);
+			appLog.error("[Auth] loginWithFacebook failed", { kind: appError?.kind, message });
+			dispatch({ type: "SET_ERROR", payload: message });
+			toast.error(message);
+			throw error;
+		} finally {
+			dispatch({ type: "SET_LOADING", payload: false });
+		}
+	};
+
 	const logout = async () => {
 		try {
 			dispatch({ type: "SET_LOADING", payload: true });
@@ -489,6 +572,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 		...state,
 		login,
 		loginWithJwt,
+		loginWithFacebook,
 		logout,
 		checkAuth,
 		savedAccounts,

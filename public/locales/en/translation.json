@@ -993,6 +993,7 @@
       "jwt_label": "JWT Token",
       "signing_in": "Signing in...",
       "submit": "Sign In",
+      "continue_with_facebook": "Continue with Facebook",
       "add_profile_title": "Add Profile",
       "add_profile_subtitle": "Sign in with the account you want to add."
     },
