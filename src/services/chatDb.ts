@@ -60,6 +60,11 @@ export function getActiveChatDbFileName(): string {
 	return activeChatDbName.replace(/^sqlite:/, "");
 }
 
+function getActiveDbOwnerId(): string | null {
+	const match = /^chat-(\d+)\.sqlite3$/.exec(getActiveChatDbFileName());
+	return match?.[1] ?? null;
+}
+
 /**
  * True as soon as this profile has ever had a conversation synced or
  * restored locally on this device. Used to gate the post-login "restore
@@ -514,9 +519,15 @@ async function getDb(): Promise<Database> {
 						display_name TEXT,
 						primary_image_hash TEXT,
 						is_favorite INTEGER NOT NULL DEFAULT 0,
+						source_profile_id TEXT,
 						updated_at INTEGER NOT NULL
 					)
 				`);
+				try {
+					await db.execute("ALTER TABLE known_profiles ADD COLUMN source_profile_id TEXT");
+				} catch {
+					// already migrated
+				}
 				await db.execute(
 					"CREATE INDEX IF NOT EXISTS idx_known_profiles_hash ON known_profiles(primary_image_hash)",
 				);
@@ -530,15 +541,46 @@ async function getDb(): Promise<Database> {
 						profile_id TEXT NOT NULL,
 						image_hash TEXT NOT NULL,
 						first_seen_at INTEGER NOT NULL,
-						last_seen_at INTEGER NOT NULL
+						last_seen_at INTEGER NOT NULL,
+						source_profile_id TEXT
 					)
 				`);
+				try {
+					await db.execute("ALTER TABLE profile_photo_history ADD COLUMN source_profile_id TEXT");
+				} catch {
+					// already migrated
+				}
 				await db.execute(
 					"CREATE INDEX IF NOT EXISTS idx_profile_photo_history_profile ON profile_photo_history(profile_id, last_seen_at DESC)",
 				);
 				await db.execute(
 					"CREATE INDEX IF NOT EXISTS idx_profile_photo_history_hash ON profile_photo_history(image_hash)",
 				);
+
+				try {
+					await db.execute("ALTER TABLE conversations ADD COLUMN source_owner_id TEXT");
+				} catch {
+					// already migrated
+				}
+				try {
+					await db.execute("ALTER TABLE messages ADD COLUMN source_owner_id TEXT");
+				} catch {
+					// already migrated
+				}
+
+				await db.execute(`
+					CREATE TABLE IF NOT EXISTS data_pull_log (
+						id TEXT PRIMARY KEY,
+						source_owner_id TEXT,
+						target_owner_id TEXT,
+						source_format TEXT NOT NULL,
+						source_label TEXT,
+						categories_json TEXT NOT NULL,
+						tables_json TEXT NOT NULL,
+						rows_imported INTEGER NOT NULL,
+						pulled_at INTEGER NOT NULL
+					)
+				`);
 			});
 
 			return db;
@@ -2830,6 +2872,7 @@ export interface StoredKnownProfile {
 	displayName: string | null;
 	primaryImageHash: string | null;
 	isFavorite: boolean;
+	sourceProfileId?: string | null;
 	updatedAt: number;
 }
 
@@ -2839,6 +2882,7 @@ export interface StoredProfilePhotoHistoryEntry {
 	imageHash: string;
 	firstSeenAt: number;
 	lastSeenAt: number;
+	sourceProfileId?: string | null;
 }
 
 export interface KnownProfileDirectoryEntry extends StoredKnownProfile {
@@ -2851,6 +2895,7 @@ export interface KnownProfileUpsertInput {
 	primaryImageHash?: string | null;
 	extraImageHashes?: (string | null | undefined)[];
 	isFavorite?: boolean;
+	sourceProfileId?: string | null;
 }
 
 type KnownProfileRow = {
@@ -2858,6 +2903,7 @@ type KnownProfileRow = {
 	display_name: string | null;
 	primary_image_hash: string | null;
 	is_favorite: number;
+	source_profile_id: string | null;
 	updated_at: number;
 };
 
@@ -2867,6 +2913,7 @@ type ProfilePhotoHistoryRow = {
 	image_hash: string;
 	first_seen_at: number;
 	last_seen_at: number;
+	source_profile_id: string | null;
 };
 
 function sanitizeProfileId(raw: string | null | undefined): string | null {
@@ -2909,12 +2956,13 @@ async function writeKnownProfileTx(
 			? entry.primaryImageHash.trim()
 			: null;
 	const isFavNum = entry.isFavorite ? 1 : 0;
+	const sourceProfileId = entry.sourceProfileId?.trim() || getActiveDbOwnerId();
 
 	await db.execute(
 		`
 		INSERT INTO known_profiles (
-			profile_id, display_name, primary_image_hash, is_favorite, updated_at
-		) VALUES ($1, $2, $3, $4, $5)
+			profile_id, display_name, primary_image_hash, is_favorite, source_profile_id, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT(profile_id) DO UPDATE SET
 			display_name = COALESCE(NULLIF(excluded.display_name, ''), known_profiles.display_name),
 			primary_image_hash = COALESCE(NULLIF(excluded.primary_image_hash, ''), known_profiles.primary_image_hash),
@@ -2922,9 +2970,10 @@ async function writeKnownProfileTx(
 				WHEN excluded.is_favorite = 1 OR known_profiles.is_favorite = 1 THEN 1
 				ELSE 0
 			END,
+			source_profile_id = COALESCE(NULLIF(known_profiles.source_profile_id, ''), excluded.source_profile_id),
 			updated_at = excluded.updated_at
 		`,
-		[profileId, displayName, primaryImageHash, isFavNum, now],
+		[profileId, displayName, primaryImageHash, isFavNum, sourceProfileId, now],
 	);
 
 	const hashes = collectValidImageHashes(entry);
@@ -2932,13 +2981,14 @@ async function writeKnownProfileTx(
 		await db.execute(
 			`
 			INSERT INTO profile_photo_history (
-				id, profile_id, image_hash, first_seen_at, last_seen_at
-			) VALUES ($1, $2, $3, $4, $4)
+				id, profile_id, image_hash, first_seen_at, last_seen_at, source_profile_id
+			) VALUES ($1, $2, $3, $4, $4, $5)
 			ON CONFLICT(id) DO UPDATE SET
 				first_seen_at = MIN(profile_photo_history.first_seen_at, excluded.first_seen_at),
-				last_seen_at = MAX(profile_photo_history.last_seen_at, excluded.last_seen_at)
+				last_seen_at = MAX(profile_photo_history.last_seen_at, excluded.last_seen_at),
+				source_profile_id = COALESCE(NULLIF(profile_photo_history.source_profile_id, ''), excluded.source_profile_id)
 			`,
-			[`${profileId}:${hash}`, profileId, hash, now],
+			[`${profileId}:${hash}`, profileId, hash, now, sourceProfileId],
 		);
 	}
 
@@ -3046,7 +3096,7 @@ export async function getProfilePhotoHistory(
 	const db = await getDb();
 	const rows = await db.select<ProfilePhotoHistoryRow[]>(
 		`
-		SELECT id, profile_id, image_hash, first_seen_at, last_seen_at
+		SELECT id, profile_id, image_hash, first_seen_at, last_seen_at, source_profile_id
 		FROM profile_photo_history
 		WHERE profile_id = $1
 		ORDER BY last_seen_at DESC, first_seen_at DESC
@@ -3059,6 +3109,7 @@ export async function getProfilePhotoHistory(
 		imageHash: r.image_hash,
 		firstSeenAt: r.first_seen_at,
 		lastSeenAt: r.last_seen_at,
+		sourceProfileId: r.source_profile_id,
 	}));
 }
 
@@ -3069,7 +3120,7 @@ export async function getKnownProfileDirectory(): Promise<{
 	const db = await getDb();
 	const [knownRows, convRows, historyRows] = await Promise.all([
 		db.select<KnownProfileRow[]>(
-			"SELECT profile_id, display_name, primary_image_hash, is_favorite, updated_at FROM known_profiles",
+			"SELECT profile_id, display_name, primary_image_hash, is_favorite, source_profile_id, updated_at FROM known_profiles",
 		),
 		db.select<
 			{
@@ -3083,7 +3134,7 @@ export async function getKnownProfileDirectory(): Promise<{
 			"SELECT other_profile_id, name, participants_json, favorite, updated_at FROM conversations WHERE other_profile_id IS NOT NULL",
 		),
 		db.select<ProfilePhotoHistoryRow[]>(
-			"SELECT id, profile_id, image_hash, first_seen_at, last_seen_at FROM profile_photo_history ORDER BY last_seen_at DESC",
+			"SELECT id, profile_id, image_hash, first_seen_at, last_seen_at, source_profile_id FROM profile_photo_history ORDER BY last_seen_at DESC",
 		),
 	]);
 
@@ -3109,6 +3160,7 @@ export async function getKnownProfileDirectory(): Promise<{
 		primaryImageHash: string | null,
 		isFavorite: boolean,
 		updatedAt: number,
+		sourceProfileId?: string | null,
 	) => {
 		const id = sanitizeProfileId(profileId);
 		if (!id) return;
@@ -3117,12 +3169,14 @@ export async function getKnownProfileDirectory(): Promise<{
 			recordProfileHash(id, primaryImageHash);
 		}
 		const count = hashCountByProfile.get(id)?.size ?? 0;
+		const cleanSource = sourceProfileId?.trim() || null;
 		if (!existing) {
 			byProfileId.set(id, {
 				profileId: id,
 				displayName: displayName?.trim() || null,
 				primaryImageHash: primaryImageHash?.trim() || null,
 				isFavorite,
+				sourceProfileId: cleanSource,
 				updatedAt,
 				photoChangeCount: count,
 			});
@@ -3136,6 +3190,7 @@ export async function getKnownProfileDirectory(): Promise<{
 					? (primaryImageHash?.trim() || existing.primaryImageHash)
 					: (existing.primaryImageHash || primaryImageHash?.trim() || null),
 			isFavorite: existing.isFavorite || isFavorite,
+			sourceProfileId: existing.sourceProfileId || cleanSource,
 			updatedAt: Math.max(existing.updatedAt, updatedAt),
 			photoChangeCount: Math.max(existing.photoChangeCount, count),
 		});
@@ -3148,6 +3203,7 @@ export async function getKnownProfileDirectory(): Promise<{
 			row.primary_image_hash,
 			Boolean(row.is_favorite),
 			row.updated_at,
+			row.source_profile_id,
 		);
 	}
 

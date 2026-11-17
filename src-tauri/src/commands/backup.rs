@@ -23,7 +23,7 @@
 //! (Stored, uncompressed - photos/video are already compressed); import
 //! re-encodes them back to base64 text to match the existing column type.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,7 @@ const BACKUP_VERSION: i64 = 2;
 const EXPORT_PROGRESS_EVENT: &str = "backup-export-progress";
 const IMPORT_PROGRESS_EVENT: &str = "backup-import-progress";
 const PROGRESS_EVERY_N_ROWS: u64 = 200;
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 struct TableSpec {
     name: &'static str,
@@ -58,9 +59,10 @@ struct TableSpec {
     blob_columns: &'static [&'static str],
 }
 
-/// Mirrors `FULL_EXPORT_TABLES` in `src/services/chatDb.ts` exactly, including
-/// the deliberate omission of `album_media.position` (a real schema column
-/// that the JS export has never included) - keep behavior identical.
+/// Mirrors `FULL_EXPORT_TABLES` in `src/services/chatDb.ts` plus provenance &
+/// diagnostic capture tables (`profile_snapshots`, `block_events`,
+/// `hidden_profiles`, `downloaded_media`, `drawer_media_usage`, `data_pull_log`),
+/// while preserving omission of `album_media.position`.
 const EXPORT_TABLES: &[TableSpec] = &[
     TableSpec {
         name: "conversations",
@@ -82,6 +84,7 @@ const EXPORT_TABLES: &[TableSpec] = &[
             "archived_at",
             "hidden",
             "last_seen_in_inbox_at",
+            "source_owner_id",
             "created_at",
             "updated_at",
         ],
@@ -111,6 +114,7 @@ const EXPORT_TABLES: &[TableSpec] = &[
             "reply_to_message_id",
             "reply_preview_json",
             "reactions_json",
+            "source_owner_id",
             "created_at",
             "updated_at",
         ],
@@ -250,6 +254,7 @@ const EXPORT_TABLES: &[TableSpec] = &[
             "display_name",
             "primary_image_hash",
             "is_favorite",
+            "source_profile_id",
             "updated_at",
         ],
         blob_columns: &[],
@@ -258,7 +263,101 @@ const EXPORT_TABLES: &[TableSpec] = &[
         name: "profile_photo_history",
         primary_key: "id",
         category: "media_albums",
-        columns: &["id", "profile_id", "image_hash", "first_seen_at", "last_seen_at"],
+        columns: &[
+            "id",
+            "profile_id",
+            "image_hash",
+            "first_seen_at",
+            "last_seen_at",
+            "source_profile_id",
+        ],
+        blob_columns: &[],
+    },
+    TableSpec {
+        name: "profile_snapshots",
+        primary_key: "profile_id",
+        category: "chat_messages",
+        columns: &[
+            "profile_id",
+            "display_name",
+            "primary_image_hash",
+            "snapshot_json",
+            "captured_at",
+        ],
+        blob_columns: &[],
+    },
+    TableSpec {
+        name: "block_events",
+        primary_key: "profile_id",
+        category: "chat_messages",
+        columns: &[
+            "profile_id",
+            "direction",
+            "display_name",
+            "primary_image_hash",
+            "first_detected_at",
+            "last_detected_at",
+        ],
+        blob_columns: &[],
+    },
+    TableSpec {
+        name: "hidden_profiles",
+        primary_key: "profile_id",
+        category: "chat_messages",
+        columns: &["profile_id", "hidden_at", "reason"],
+        blob_columns: &[],
+    },
+    TableSpec {
+        name: "downloaded_media",
+        primary_key: "media_hash",
+        category: "media_albums",
+        columns: &[
+            "media_hash",
+            "source_url",
+            "mime_type",
+            "width",
+            "height",
+            "size_bytes",
+            "data_base64",
+            "fetched_at",
+        ],
+        blob_columns: &["data_base64"],
+    },
+    TableSpec {
+        name: "drawer_media_usage",
+        primary_key: "key",
+        category: "media_albums",
+        columns: &[
+            "key",
+            "kind",
+            "media_id",
+            "media_hash",
+            "album_id",
+            "content_id",
+            "url",
+            "mime_type",
+            "width",
+            "height",
+            "use_count",
+            "last_used_at",
+            "first_used_at",
+        ],
+        blob_columns: &[],
+    },
+    TableSpec {
+        name: "data_pull_log",
+        primary_key: "id",
+        category: "chat_messages",
+        columns: &[
+            "id",
+            "pulled_at",
+            "target_owner_id",
+            "source_owner_id",
+            "source_format",
+            "source_name",
+            "tables_json",
+            "rows_imported",
+        ],
         blob_columns: &[],
     },
 ];
@@ -275,7 +374,7 @@ struct ExportProgress<'a> {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportProgress<'a> {
-    table: &'a str,
+    table: std::borrow::Cow<'a, str>,
     table_index: usize,
     table_count: usize,
     rows_done: u64,
@@ -298,6 +397,10 @@ pub struct BackupInspection {
     #[serde(skip_serializing_if = "Option::is_none")]
     categories: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    tables: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     exported_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner_user_id: Option<i64>,
@@ -305,6 +408,58 @@ pub struct BackupInspection {
     is_different_owner: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolledTableInfo {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_key: Option<String>,
+    row_count: u64,
+    columns: Vec<String>,
+    known_export_table: bool,
+    has_blobs: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabasePollResult {
+    ok: bool,
+    source_kind: String,
+    source_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_user_id: Option<i64>,
+    tables: Vec<PolledTableInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDatabaseEntry {
+    file_name: String,
+    path: String,
+    size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_user_id: Option<i64>,
+    kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TablePreviewResult {
+    ok: bool,
+    table: String,
+    columns: Vec<String>,
+    total_rows: u64,
+    rows: Vec<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Falls back to this if an archive's manifest predates the `categories`
@@ -449,11 +604,44 @@ fn build_upsert_sql(table: &TableSpec) -> String {
             ("known_profiles", "is_favorite" | "updated_at") => {
                 format!("{c} = MAX(known_profiles.{c}, excluded.{c})")
             }
+            ("known_profiles", "source_profile_id") => {
+                "source_profile_id = COALESCE(NULLIF(known_profiles.source_profile_id, ''), excluded.source_profile_id)".to_owned()
+            }
             ("profile_photo_history", "first_seen_at") => {
                 "first_seen_at = MIN(profile_photo_history.first_seen_at, excluded.first_seen_at)".to_owned()
             }
             ("profile_photo_history", "last_seen_at") => {
                 "last_seen_at = MAX(profile_photo_history.last_seen_at, excluded.last_seen_at)".to_owned()
+            }
+            ("profile_photo_history", "source_profile_id") => {
+                "source_profile_id = COALESCE(NULLIF(profile_photo_history.source_profile_id, ''), excluded.source_profile_id)".to_owned()
+            }
+            ("conversations", "source_owner_id") | ("messages", "source_owner_id") => {
+                format!("{c} = COALESCE(NULLIF({t}.{c}, ''), excluded.{c})")
+            }
+            ("profile_snapshots", "display_name" | "primary_image_hash") => {
+                format!("{c} = COALESCE(NULLIF(excluded.{c}, ''), profile_snapshots.{c})")
+            }
+            ("profile_snapshots", "snapshot_json") => {
+                "snapshot_json = CASE WHEN excluded.captured_at >= profile_snapshots.captured_at THEN excluded.snapshot_json ELSE profile_snapshots.snapshot_json END".to_owned()
+            }
+            ("profile_snapshots", "captured_at") => {
+                "captured_at = MAX(profile_snapshots.captured_at, excluded.captured_at)".to_owned()
+            }
+            ("block_events", "first_detected_at") => {
+                "first_detected_at = MIN(block_events.first_detected_at, excluded.first_detected_at)".to_owned()
+            }
+            ("block_events", "last_detected_at") => {
+                "last_detected_at = MAX(block_events.last_detected_at, excluded.last_detected_at)".to_owned()
+            }
+            ("block_events", "display_name" | "primary_image_hash") => {
+                format!("{c} = COALESCE(NULLIF(excluded.{c}, ''), block_events.{c})")
+            }
+            ("drawer_media_usage", "use_count" | "last_used_at") => {
+                format!("{c} = MAX(drawer_media_usage.{c}, excluded.{c})")
+            }
+            ("drawer_media_usage", "first_used_at") => {
+                "first_used_at = MIN(drawer_media_usage.first_used_at, excluded.first_used_at)".to_owned()
             }
             (_, col) if table.blob_columns.contains(&col) => {
                 format!("{col} = COALESCE(NULLIF(excluded.{col}, ''), {t}.{col})")
@@ -737,6 +925,55 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AppError> {
     Ok(count > 0)
 }
 
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn validate_table_name(conn: &Connection, table_name: &str) -> Result<String, AppError> {
+    let exact: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table_name],
+            |r| r.get(0),
+        )
+        .ok();
+    exact.ok_or_else(|| AppError::Backup(format!("table '{table_name}' does not exist")))
+}
+
+fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>, AppError> {
+    let sql = format!("PRAGMA table_info({})", quote_ident(table_name));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut cols = Vec::new();
+    while let Some(row) = rows.next()? {
+        let col_name: String = row.get(1)?;
+        cols.push(col_name);
+    }
+    Ok(cols)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+    column_def: &str,
+) -> Result<(), AppError> {
+    if !table_exists(conn, table_name)? {
+        return Ok(());
+    }
+    let cols = table_columns(conn, table_name)?;
+    if cols.iter().any(|c| c == column_name) {
+        return Ok(());
+    }
+    let sql = format!(
+        "ALTER TABLE {} ADD COLUMN {} {column_def}",
+        quote_ident(table_name),
+        quote_ident(column_name)
+    );
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
 fn ensure_optional_directory_tables(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         r#"
@@ -745,6 +982,7 @@ fn ensure_optional_directory_tables(conn: &Connection) -> Result<(), AppError> {
             display_name TEXT,
             primary_image_hash TEXT,
             is_favorite INTEGER NOT NULL DEFAULT 0,
+            source_profile_id TEXT,
             updated_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS profile_photo_history (
@@ -752,9 +990,225 @@ fn ensure_optional_directory_tables(conn: &Connection) -> Result<(), AppError> {
             profile_id TEXT NOT NULL,
             image_hash TEXT NOT NULL,
             first_seen_at INTEGER NOT NULL,
-            last_seen_at INTEGER NOT NULL
+            last_seen_at INTEGER NOT NULL,
+            source_profile_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS profile_snapshots (
+            profile_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            primary_image_hash TEXT,
+            snapshot_json TEXT NOT NULL,
+            captured_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS block_events (
+            profile_id TEXT PRIMARY KEY,
+            direction TEXT NOT NULL,
+            display_name TEXT,
+            primary_image_hash TEXT,
+            first_detected_at INTEGER NOT NULL,
+            last_detected_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS hidden_profiles (
+            profile_id TEXT PRIMARY KEY,
+            hidden_at INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'hidden'
+        );
+        CREATE TABLE IF NOT EXISTS downloaded_media (
+            media_hash TEXT PRIMARY KEY,
+            source_url TEXT NOT NULL,
+            mime_type TEXT,
+            width INTEGER,
+            height INTEGER,
+            size_bytes INTEGER NOT NULL,
+            data_base64 TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS drawer_media_usage (
+            key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            media_id TEXT,
+            media_hash TEXT,
+            album_id TEXT,
+            content_id TEXT,
+            url TEXT,
+            mime_type TEXT,
+            width INTEGER,
+            height INTEGER,
+            use_count INTEGER NOT NULL DEFAULT 1,
+            last_used_at INTEGER NOT NULL,
+            first_used_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS data_pull_log (
+            id TEXT PRIMARY KEY,
+            pulled_at INTEGER NOT NULL,
+            target_owner_id TEXT NOT NULL,
+            source_owner_id TEXT,
+            source_format TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            tables_json TEXT NOT NULL,
+            rows_imported INTEGER NOT NULL DEFAULT 0
         );
         "#,
+    )?;
+    add_column_if_missing(conn, "conversations", "source_owner_id", "TEXT")?;
+    add_column_if_missing(conn, "messages", "source_owner_id", "TEXT")?;
+    add_column_if_missing(conn, "known_profiles", "source_profile_id", "TEXT")?;
+    add_column_if_missing(conn, "profile_photo_history", "source_profile_id", "TEXT")?;
+    Ok(())
+}
+
+fn stamp_provenance_for_row(table_name: &str, row_map: &mut Map<String, Value>, source_owner: i64) {
+    let source_str = source_owner.to_string();
+    let col = match table_name {
+        "conversations" | "messages" => "source_owner_id",
+        "known_profiles" | "profile_photo_history" => "source_profile_id",
+        _ => return,
+    };
+    let is_empty = match row_map.get(col) {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.trim().is_empty(),
+        _ => false,
+    };
+    if is_empty {
+        row_map.insert(col.to_string(), Value::String(source_str));
+    }
+}
+
+fn is_sqlite_file(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    let Ok(read) = file.read(&mut header) else {
+        return false;
+    };
+    read == 16 && &header == SQLITE_HEADER
+}
+
+fn parse_owner_from_file_name(path: &Path) -> Option<i64> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("chat-")?;
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse::<i64>().ok()
+}
+
+fn infer_sqlite_owner(conn: &Connection, path: &Path) -> Option<i64> {
+    if let Some(id) = parse_owner_from_file_name(path) {
+        return Some(id);
+    }
+    if table_exists(conn, "conversations").unwrap_or(false) {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT conversation_id, other_profile_id FROM conversations WHERE other_profile_id IS NOT NULL LIMIT 25",
+        ) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let conv: String = row.get(0).unwrap_or_default();
+                    let other: String = row.get(1).unwrap_or_default();
+                    if let Some((a, b)) = conv.split_once(':') {
+                        if a == other && b != other {
+                            if let Ok(parsed) = b.parse::<i64>() {
+                                return Some(parsed);
+                            }
+                        } else if b == other && a != other {
+                            if let Ok(parsed) = a.parse::<i64>() {
+                                return Some(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let cols = table_columns(conn, "conversations").unwrap_or_default();
+        if cols.iter().any(|c| c == "source_owner_id") {
+            if let Ok(Some(raw)) = conn.query_row(
+                "SELECT source_owner_id FROM conversations WHERE source_owner_id IS NOT NULL AND source_owner_id != '' LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            ) {
+                if let Ok(parsed) = raw.trim().parse::<i64>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    if table_exists(conn, "albums").unwrap_or(false) {
+        if let Ok(Some(raw)) = conn.query_row(
+            "SELECT owner_profile_id FROM albums WHERE owner_profile_id IS NOT NULL AND owner_profile_id != '' LIMIT 1",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        ) {
+            if let Ok(parsed) = raw.trim().parse::<i64>() {
+                return Some(parsed);
+            }
+        }
+    }
+    if table_exists(conn, "known_profiles").unwrap_or(false) {
+        let cols = table_columns(conn, "known_profiles").unwrap_or_default();
+        if cols.iter().any(|c| c == "source_profile_id") {
+            if let Ok(Some(raw)) = conn.query_row(
+                "SELECT source_profile_id FROM known_profiles WHERE source_profile_id IS NOT NULL AND source_profile_id != '' LIMIT 1",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            ) {
+                if let Ok(parsed) = raw.trim().parse::<i64>() {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn select_tables_for_operation(
+    categories: &[String],
+    tables: Option<&[String]>,
+) -> Vec<&'static TableSpec> {
+    if let Some(explicit) = tables {
+        let set: HashSet<&str> = explicit.iter().map(String::as_str).collect();
+        EXPORT_TABLES
+            .iter()
+            .filter(|t| set.contains(t.name))
+            .collect()
+    } else {
+        EXPORT_TABLES
+            .iter()
+            .filter(|t| categories.iter().any(|c| c == t.category))
+            .collect()
+    }
+}
+
+fn record_pull_log(
+    tx: &rusqlite::Transaction<'_>,
+    target_owner_id: i64,
+    source_owner_id: Option<i64>,
+    source_format: &str,
+    source_name: &str,
+    imported_tables: &[String],
+    rows_imported: u64,
+) -> Result<(), AppError> {
+    let pulled_at = chrono::Utc::now().timestamp_millis();
+    let unique_nanos = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(pulled_at * 1_000_000);
+    let id = format!(
+        "pull-{unique_nanos}-{}",
+        source_owner_id.map_or_else(|| "shared".to_owned(), |v| v.to_string())
+    );
+    let tables_json = serde_json::to_string(imported_tables)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO data_pull_log (id, pulled_at, target_owner_id, source_owner_id, source_format, source_name, tables_json, rows_imported) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            id,
+            pulled_at,
+            target_owner_id.to_string(),
+            source_owner_id.map(|v| v.to_string()),
+            source_format,
+            source_name,
+            tables_json,
+            rows_imported as i64,
+        ],
     )?;
     Ok(())
 }
@@ -781,6 +1235,20 @@ fn export_backup_to_path<F>(
     owner_user_id: i64,
     dest_path: &Path,
     categories: &[String],
+    on_progress: F,
+) -> Result<(), AppError>
+where
+    F: FnMut(ExportProgress<'_>),
+{
+    export_backup_to_path_with_options(db_path, owner_user_id, dest_path, categories, None, on_progress)
+}
+
+fn export_backup_to_path_with_options<F>(
+    db_path: &Path,
+    owner_user_id: i64,
+    dest_path: &Path,
+    categories: &[String],
+    tables: Option<&[String]>,
     mut on_progress: F,
 ) -> Result<(), AppError>
 where
@@ -793,10 +1261,17 @@ where
         std::fs::create_dir_all(parent)?;
     }
 
-    let selected_tables: Vec<&TableSpec> = EXPORT_TABLES
-        .iter()
-        .filter(|t| categories.iter().any(|c| c == t.category))
-        .collect();
+    let selected_tables = select_tables_for_operation(categories, tables);
+    let mut manifest_categories: Vec<String> = Vec::new();
+    for table in &selected_tables {
+        if !manifest_categories.iter().any(|c| c == table.category) {
+            manifest_categories.push(table.category.to_owned());
+        }
+    }
+    if manifest_categories.is_empty() {
+        manifest_categories = categories.to_vec();
+    }
+    let selected_table_names: Vec<&str> = selected_tables.iter().map(|t| t.name).collect();
 
     let file = File::create(dest_path)?;
     let mut zip = ZipWriter::new(BufWriter::new(file));
@@ -808,7 +1283,8 @@ where
         "version": BACKUP_VERSION,
         "exportedAt": chrono::Utc::now().timestamp_millis(),
         "ownerUserId": owner_user_id,
-        "categories": categories,
+        "categories": manifest_categories,
+        "tables": selected_table_names,
     });
     zip.write_all(manifest.to_string().as_bytes())?;
 
@@ -824,11 +1300,27 @@ where
             continue;
         }
 
+        let existing_cols: HashSet<String> = table_columns(&conn, table.name)?.into_iter().collect();
+        let select_cols_csv = table
+            .columns
+            .iter()
+            .map(|c| {
+                if existing_cols.contains(*c) {
+                    quote_ident(c)
+                } else {
+                    format!("NULL AS {}", quote_ident(c))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order_col = if existing_cols.contains(table.primary_key) {
+            quote_ident(table.primary_key)
+        } else {
+            "rowid".to_owned()
+        };
         let select_sql = format!(
-            "SELECT {} FROM {} ORDER BY {}",
-            table.columns.join(", "),
-            table.name,
-            table.primary_key
+            "SELECT {select_cols_csv} FROM {} ORDER BY {order_col}",
+            quote_ident(table.name)
         );
         let mut stmt = conn
             .prepare(&select_sql)
@@ -869,6 +1361,10 @@ where
                 }
             }
 
+            if owner_user_id > 0 {
+                stamp_provenance_for_row(table.name, &mut obj, owner_user_id);
+            }
+
             zip.write_all(Value::Object(obj).to_string().as_bytes())?;
             zip.write_all(b"\n")?;
 
@@ -882,6 +1378,97 @@ where
     }
 
     zip.finish()?;
+    Ok(())
+}
+
+fn export_sqlite_db_to_path(
+    db_path: &Path,
+    owner_user_id: i64,
+    dest_path: &Path,
+    categories: Option<&[String]>,
+    tables: Option<&[String]>,
+) -> Result<(), AppError> {
+    if let Some(parent) = dest_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    if dest_path.exists() {
+        std::fs::remove_file(dest_path)?;
+    }
+
+    // Open source RW briefly only to flush WAL consistently during VACUUM INTO,
+    // without modifying any data in the live database.
+    let src_conn = Connection::open(db_path)?;
+    src_conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    let dest_str = dest_path
+        .to_str()
+        .ok_or_else(|| AppError::Backup("destination path is not valid UTF-8".to_owned()))?;
+    src_conn
+        .execute("VACUUM INTO ?1", [dest_str])
+        .map_err(|e| AppError::Backup(format!("failed to snapshot sqlite database: {e}")))?;
+
+    let snap_conn = Connection::open(dest_path)?;
+    snap_conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+
+    if owner_user_id > 0 {
+        let owner_str = owner_user_id.to_string();
+        for (tbl, col) in [
+            ("conversations", "source_owner_id"),
+            ("messages", "source_owner_id"),
+            ("known_profiles", "source_profile_id"),
+            ("profile_photo_history", "source_profile_id"),
+        ] {
+            if table_exists(&snap_conn, tbl)? {
+                add_column_if_missing(&snap_conn, tbl, col, "TEXT")?;
+                let sql = format!(
+                    "UPDATE {} SET {} = ?1 WHERE {} IS NULL OR {} = ''",
+                    quote_ident(tbl),
+                    quote_ident(col),
+                    quote_ident(col),
+                    quote_ident(col)
+                );
+                let _ = snap_conn.execute(&sql, [&owner_str]);
+            }
+        }
+    }
+
+    let filter_set: Option<HashSet<String>> = if let Some(explicit) = tables {
+        Some(explicit.iter().cloned().collect())
+    } else if let Some(cats) = categories {
+        let all_cats_selected = ALL_CATEGORY_IDS
+            .iter()
+            .all(|cat| cats.iter().any(|c| c == cat));
+        if all_cats_selected {
+            None
+        } else {
+            Some(
+                EXPORT_TABLES
+                    .iter()
+                    .filter(|t| cats.iter().any(|c| c == t.category))
+                    .map(|t| t.name.to_owned())
+                    .collect(),
+            )
+        }
+    } else {
+        None
+    };
+
+    if let Some(allowed) = filter_set {
+        let mut stmt = snap_conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let table_names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for name in table_names {
+            if !allowed.contains(&name) {
+                let sql = format!("DROP TABLE IF EXISTS {}", quote_ident(&name));
+                snap_conn.execute_batch(&sql)?;
+            }
+        }
+        snap_conn.execute_batch("VACUUM;")?;
+    }
+
     Ok(())
 }
 
@@ -909,22 +1496,440 @@ pub fn export_backup_to_file(
     owner_user_id: i64,
     dest_path: String,
     categories: Vec<String>,
+    tables: Option<Vec<String>>,
 ) -> Result<(), AppError> {
     let db_path = resolve_db_path(&app, &db_file_name)?;
     let resolved_dest = resolve_export_dest_path(&app, &dest_path)?;
-    export_backup_to_path(&db_path, owner_user_id, &resolved_dest, &categories, |progress| {
-        let _ = app.emit(EXPORT_PROGRESS_EVENT, progress);
+    export_backup_to_path_with_options(
+        &db_path,
+        owner_user_id,
+        &resolved_dest,
+        &categories,
+        tables.as_deref(),
+        |progress| {
+            let _ = app.emit(EXPORT_PROGRESS_EVENT, progress);
+        },
+    )
+}
+
+#[tauri::command]
+pub fn export_sqlite_db_to_file(
+    app: AppHandle,
+    db_file_name: String,
+    owner_user_id: i64,
+    dest_path: String,
+    categories: Option<Vec<String>>,
+    tables: Option<Vec<String>>,
+) -> Result<String, AppError> {
+    let db_path = resolve_db_path(&app, &db_file_name)?;
+    let resolved_dest = resolve_export_dest_path(&app, &dest_path)?;
+    export_sqlite_db_to_path(
+        &db_path,
+        owner_user_id,
+        &resolved_dest,
+        categories.as_deref(),
+        tables.as_deref(),
+    )?;
+    Ok(resolved_dest.to_string_lossy().into_owned())
+}
+
+fn poll_sqlite_connection(conn: &Connection) -> Result<Vec<PolledTableInfo>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let table_names: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut tables = Vec::with_capacity(table_names.len());
+    for name in table_names {
+        let count_sql = format!("SELECT COUNT(*) FROM {}", quote_ident(&name));
+        let row_count: i64 = conn.query_row(&count_sql, [], |r| r.get(0)).unwrap_or(0);
+        let columns = table_columns(conn, &name)?;
+        let spec = EXPORT_TABLES.iter().find(|t| t.name == name);
+        tables.push(PolledTableInfo {
+            name,
+            category: spec.map(|s| s.category.to_owned()),
+            primary_key: spec.map(|s| s.primary_key.to_owned()),
+            row_count: row_count.max(0) as u64,
+            columns,
+            known_export_table: spec.is_some(),
+            has_blobs: spec.map(|s| !s.blob_columns.is_empty()).unwrap_or(false),
+        });
+    }
+    Ok(tables)
+}
+
+fn poll_sqlite_at_path(src_path: &Path) -> Result<DatabasePollResult, AppError> {
+    let conn = Connection::open_with_flags(src_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+    let tables = poll_sqlite_connection(&conn)?;
+    let owner_user_id = infer_sqlite_owner(&conn, src_path);
+    let source_name = src_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("database.sqlite3")
+        .to_owned();
+    Ok(DatabasePollResult {
+        ok: true,
+        source_kind: "sqlite".to_owned(),
+        source_name,
+        owner_user_id,
+        tables,
+        error: None,
     })
 }
 
-fn inspect_backup_at_path(src_path: &Path, owner_user_id: i64) -> Result<BackupInspection, AppError> {
+fn poll_zip_at_path(src_path: &Path) -> Result<DatabasePollResult, AppError> {
     let file = File::open(src_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
+    let source_name = src_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("backup.zip")
+        .to_owned();
+
+    let manifest_owner = match read_and_validate_manifest(&mut archive)? {
+        ManifestCheck::Invalid(err) => {
+            return Ok(DatabasePollResult {
+                ok: false,
+                source_kind: "zip".to_owned(),
+                source_name,
+                owner_user_id: None,
+                tables: Vec::new(),
+                error: Some(err.to_owned()),
+            });
+        }
+        ManifestCheck::Valid { manifest_owner, .. } => Some(manifest_owner),
+    };
+
+    let mut entry_names: Vec<String> = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            let name = entry.name().to_owned();
+            if name.starts_with("tables/") && name.ends_with(".jsonl") {
+                entry_names.push(name);
+            }
+        }
+    }
+    entry_names.sort();
+
+    let mut tables = Vec::new();
+    for entry_name in entry_names {
+        let table_name = entry_name
+            .trim_start_matches("tables/")
+            .trim_end_matches(".jsonl")
+            .to_owned();
+        let mut row_count: u64 = 0;
+        let mut first_row_cols: Vec<String> = Vec::new();
+        if let Ok(entry) = archive.by_name(&entry_name) {
+            for line_res in BufReader::new(entry).lines() {
+                if let Ok(line) = line_res {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    row_count += 1;
+                    if first_row_cols.is_empty() {
+                        if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&line) {
+                            first_row_cols = obj.keys().cloned().collect();
+                        }
+                    }
+                }
+            }
+        }
+        let spec = EXPORT_TABLES.iter().find(|t| t.name == table_name);
+        let columns = if !first_row_cols.is_empty() {
+            first_row_cols
+        } else if let Some(s) = spec {
+            s.columns.iter().map(|c| (*c).to_owned()).collect()
+        } else {
+            Vec::new()
+        };
+        tables.push(PolledTableInfo {
+            name: table_name,
+            category: spec.map(|s| s.category.to_owned()),
+            primary_key: spec.map(|s| s.primary_key.to_owned()),
+            row_count,
+            columns,
+            known_export_table: spec.is_some(),
+            has_blobs: spec.map(|s| !s.blob_columns.is_empty()).unwrap_or(false),
+        });
+    }
+
+    Ok(DatabasePollResult {
+        ok: true,
+        source_kind: "zip".to_owned(),
+        source_name,
+        owner_user_id: manifest_owner,
+        tables,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub fn poll_database_tables(
+    app: AppHandle,
+    db_file_name: Option<String>,
+    src_path: Option<String>,
+) -> Result<DatabasePollResult, AppError> {
+    if let Some(raw_path) = src_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let path = Path::new(raw_path);
+        if is_sqlite_file(path) {
+            return poll_sqlite_at_path(path);
+        }
+        return poll_zip_at_path(path);
+    }
+    let db_name = db_file_name.unwrap_or_else(|| "chat.sqlite3".to_owned());
+    let db_path = resolve_db_path(&app, &db_name)?;
+    poll_sqlite_at_path(&db_path)
+}
+
+#[tauri::command]
+pub fn list_local_databases(app: AppHandle) -> Result<Vec<LocalDatabaseEntry>, AppError> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| AppError::Backup(format!("failed to resolve app data dir: {e}")))?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(&dir)? {
+        let Ok(entry) = item else {
+            continue;
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "sqlite" | "sqlite3" | "db") {
+            continue;
+        }
+        let meta = std::fs::metadata(&path)?;
+        let modified_at = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let owner_user_id = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|conn| infer_sqlite_owner(&conn, &path));
+        let kind = if file_name.starts_with("chat-") && owner_user_id.is_some() {
+            "account".to_owned()
+        } else if file_name == "chat.sqlite3" {
+            "default".to_owned()
+        } else {
+            "shared".to_owned()
+        };
+        entries.push(LocalDatabaseEntry {
+            file_name,
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: meta.len(),
+            modified_at,
+            owner_user_id,
+            kind,
+        });
+    }
+
+    entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    Ok(entries)
+}
+
+fn sanitize_preview_value(val: Value) -> Value {
+    match val {
+        Value::String(s) if s.len() > 260 => {
+            let preview: String = s.chars().take(120).collect();
+            Value::String(format!("{preview}... [{} chars]", s.len()))
+        }
+        other => other,
+    }
+}
+
+fn preview_sqlite_table_at_path(
+    src_path: &Path,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<TablePreviewResult, AppError> {
+    let conn = Connection::open_with_flags(src_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000;");
+    let validated = validate_table_name(&conn, table_name)?;
+    let columns = table_columns(&conn, &validated)?;
+    let quoted_tbl = quote_ident(&validated);
+    let total_rows: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {quoted_tbl}"), [], |r| r.get(0))
+        .unwrap_or(0);
+    let select_cols = columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query_sql = format!(
+        "SELECT {select_cols} FROM {quoted_tbl} ORDER BY rowid DESC LIMIT ?1 OFFSET ?2"
+    );
+    let mut stmt = conn.prepare(&query_sql)?;
+    let mut query_rows = stmt.query(rusqlite::params![limit as i64, offset as i64])?;
+    let mut rows = Vec::new();
+    while let Some(row) = query_rows.next()? {
+        let mut obj = Map::new();
+        for (idx, col) in columns.iter().enumerate() {
+            let v = sanitize_preview_value(sql_value_to_json(row, idx)?);
+            obj.insert(col.clone(), v);
+        }
+        rows.push(obj);
+    }
+    Ok(TablePreviewResult {
+        ok: true,
+        table: validated,
+        columns,
+        total_rows: total_rows.max(0) as u64,
+        rows,
+        error: None,
+    })
+}
+
+fn preview_zip_table_at_path(
+    src_path: &Path,
+    table_name: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<TablePreviewResult, AppError> {
+    let file = File::open(src_path)?;
+    let mut archive = ZipArchive::new(BufReader::new(file))?;
+    let entry_name = format!("tables/{table_name}.jsonl");
+    let entry = archive
+        .by_name(&entry_name)
+        .map_err(|e| AppError::Backup(format!("table '{table_name}' not found in archive: {e}")))?;
+
+    let mut total_rows: u64 = 0;
+    let mut rows: Vec<Map<String, Value>> = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
+    let start = offset as u64;
+    let end = start + limit as u64;
+
+    for line_res in BufReader::new(entry).lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&line) {
+            if columns.is_empty() {
+                columns = obj.keys().cloned().collect();
+            }
+            if total_rows >= start && total_rows < end {
+                let sanitized = obj
+                    .into_iter()
+                    .map(|(k, v)| (k, sanitize_preview_value(v)))
+                    .collect();
+                rows.push(sanitized);
+            }
+            total_rows += 1;
+        }
+    }
+
+    Ok(TablePreviewResult {
+        ok: true,
+        table: table_name.to_owned(),
+        columns,
+        total_rows,
+        rows,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub fn preview_table_rows(
+    app: AppHandle,
+    db_file_name: Option<String>,
+    src_path: Option<String>,
+    table_name: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<TablePreviewResult, AppError> {
+    let clamped_limit = limit.unwrap_or(50).clamp(1, 200);
+    let safe_offset = offset.unwrap_or(0);
+    if let Some(raw_path) = src_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let path = Path::new(raw_path);
+        if is_sqlite_file(path) {
+            return preview_sqlite_table_at_path(path, &table_name, clamped_limit, safe_offset);
+        }
+        return preview_zip_table_at_path(path, &table_name, clamped_limit, safe_offset);
+    }
+    let db_name = db_file_name.unwrap_or_else(|| "chat.sqlite3".to_owned());
+    let db_path = resolve_db_path(&app, &db_name)?;
+    preview_sqlite_table_at_path(&db_path, &table_name, clamped_limit, safe_offset)
+}
+
+fn inspect_backup_at_path(src_path: &Path, owner_user_id: i64) -> Result<BackupInspection, AppError> {
+    if is_sqlite_file(src_path) {
+        let polled = poll_sqlite_at_path(src_path)?;
+        let mut categories: Vec<String> = Vec::new();
+        let mut tables: Vec<String> = Vec::new();
+        for tbl in &polled.tables {
+            if tbl.row_count > 0 || tbl.known_export_table {
+                tables.push(tbl.name.clone());
+            }
+            if let Some(ref cat) = tbl.category {
+                if tbl.row_count > 0 && !categories.iter().any(|c| c == cat) {
+                    categories.push(cat.clone());
+                }
+            }
+        }
+        if categories.is_empty() {
+            categories = ALL_CATEGORY_IDS.iter().map(|s| (*s).to_owned()).collect();
+        }
+        let modified_at = std::fs::metadata(src_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        let is_different = polled.owner_user_id.map(|o| o != owner_user_id);
+        return Ok(BackupInspection {
+            ok: true,
+            categories: Some(categories),
+            tables: Some(tables),
+            source_format: Some("sqlite".to_owned()),
+            exported_at: modified_at,
+            owner_user_id: polled.owner_user_id,
+            is_different_owner: is_different,
+            error: None,
+        });
+    }
+
+    let file = File::open(src_path)?;
+    let mut archive = ZipArchive::new(BufReader::new(file))?;
+
+    let mut tables = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            let name = entry.name();
+            if name.starts_with("tables/") && name.ends_with(".jsonl") {
+                tables.push(
+                    name.trim_start_matches("tables/")
+                        .trim_end_matches(".jsonl")
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    tables.sort();
 
     Ok(match read_and_validate_manifest(&mut archive)? {
         ManifestCheck::Invalid(error) => BackupInspection {
             ok: false,
             categories: None,
+            tables: None,
+            source_format: Some("zip".to_owned()),
             exported_at: None,
             owner_user_id: None,
             is_different_owner: None,
@@ -933,6 +1938,8 @@ fn inspect_backup_at_path(src_path: &Path, owner_user_id: i64) -> Result<BackupI
         ManifestCheck::Valid { categories, exported_at, manifest_owner } => BackupInspection {
             ok: true,
             categories: Some(categories),
+            tables: Some(tables),
+            source_format: Some("zip".to_owned()),
             exported_at: Some(exported_at),
             owner_user_id: Some(manifest_owner),
             is_different_owner: Some(manifest_owner != owner_user_id),
@@ -946,16 +1953,327 @@ pub fn inspect_backup_file(src_path: String, owner_user_id: i64) -> Result<Backu
     inspect_backup_at_path(Path::new(&src_path), owner_user_id)
 }
 
-fn import_backup_from_path<F>(
+fn copy_generic_sqlite_table<F>(
+    src_conn: &Connection,
+    tx: &rusqlite::Transaction<'_>,
+    table_name: &str,
+    table_index: usize,
+    table_count: usize,
+    on_progress: &mut F,
+) -> Result<u64, AppError>
+where
+    F: FnMut(ImportProgress<'_>),
+{
+    if !table_exists(src_conn, table_name)? {
+        return Ok(0);
+    }
+
+    // Create destination table from source DDL when the user explicitly selects
+    // an auxiliary table (such as chat_local_profile_meta) that doesn't yet exist.
+    let target_exists: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |r| r.get(0),
+    )?;
+    if target_exists == 0 {
+        let ddl: Option<String> = src_conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table_name],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(create_sql) = ddl {
+            tx.execute_batch(&create_sql)?;
+        } else {
+            return Ok(0);
+        }
+    }
+
+    let src_cols: HashSet<String> = table_columns(src_conn, table_name)?.into_iter().collect();
+    let dst_cols: Vec<String> = {
+        let sql = format!("PRAGMA table_info({})", quote_ident(table_name));
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        let mut cols = Vec::new();
+        while let Some(row) = rows.next()? {
+            cols.push(row.get::<_, String>(1)?);
+        }
+        cols
+    };
+
+    let shared_cols: Vec<String> = dst_cols
+        .into_iter()
+        .filter(|c| src_cols.contains(c))
+        .collect();
+    if shared_cols.is_empty() {
+        return Ok(0);
+    }
+
+    let cols_csv = shared_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = (1..=shared_cols.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_sql = format!(
+        "INSERT OR IGNORE INTO {} ({cols_csv}) VALUES ({placeholders})",
+        quote_ident(table_name)
+    );
+    let select_sql = format!("SELECT {cols_csv} FROM {}", quote_ident(table_name));
+    let mut stmt = src_conn.prepare(&select_sql)?;
+    let mut rows = stmt.query([])?;
+
+    let mut rows_done: u64 = 0;
+    while let Some(row) = rows.next()? {
+        let mut params = Vec::with_capacity(shared_cols.len());
+        for idx in 0..shared_cols.len() {
+            let val = sql_value_to_json(row, idx)?;
+            params.push(json_to_rusqlite(&val)?);
+        }
+        tx.execute(&insert_sql, rusqlite::params_from_iter(params.iter()))?;
+        rows_done += 1;
+        if rows_done % PROGRESS_EVERY_N_ROWS == 0 {
+            on_progress(ImportProgress {
+                table: std::borrow::Cow::Borrowed(table_name),
+                table_index,
+                table_count,
+                rows_done,
+            });
+        }
+    }
+    Ok(rows_done)
+}
+
+fn import_sqlite_from_path<F>(
     db_path: &Path,
     owner_user_id: i64,
     src_path: &Path,
     categories: &[String],
+    tables: Option<&[String]>,
+    source_label: Option<&str>,
     mut on_progress: F,
 ) -> Result<ImportOutcome, AppError>
 where
     F: FnMut(ImportProgress<'_>),
 {
+    let src_conn = Connection::open_with_flags(src_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    src_conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+
+    let detected_owner = infer_sqlite_owner(&src_conn, src_path);
+    let manifest_owner = detected_owner.unwrap_or(owner_user_id);
+
+    let selected_specs = select_tables_for_operation(categories, tables);
+    let selected_spec_names: HashSet<&str> = selected_specs.iter().map(|t| t.name).collect();
+    let extra_tables: Vec<String> = tables
+        .map(|list| {
+            list.iter()
+                .filter(|name| !selected_spec_names.contains(name.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut dst_conn = Connection::open(db_path)?;
+    dst_conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    ensure_optional_directory_tables(&dst_conn)?;
+    let partner_to_conv_id = if manifest_owner != owner_user_id {
+        load_existing_partner_map(&dst_conn)
+    } else {
+        HashMap::new()
+    };
+    let mut conv_id_map: HashMap<String, String> = HashMap::new();
+
+    let tx = dst_conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    let mut total_rows_imported: u64 = 0;
+    let table_count = selected_specs.len() + extra_tables.len();
+    let mut imported_table_names: Vec<String> = Vec::new();
+
+    for (table_index, table) in selected_specs.into_iter().enumerate() {
+        if !table_exists(&src_conn, table.name)? {
+            on_progress(ImportProgress {
+                table: std::borrow::Cow::Borrowed(table.name),
+                table_index,
+                table_count,
+                rows_done: 0,
+            });
+            continue;
+        }
+
+        let existing_cols: HashSet<String> =
+            table_columns(&src_conn, table.name)?.into_iter().collect();
+        let select_cols_csv = table
+            .columns
+            .iter()
+            .map(|c| {
+                if existing_cols.contains(*c) {
+                    quote_ident(c)
+                } else {
+                    format!("NULL AS {}", quote_ident(c))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order_col = if existing_cols.contains(table.primary_key) {
+            quote_ident(table.primary_key)
+        } else {
+            "rowid".to_owned()
+        };
+        let select_sql = format!(
+            "SELECT {select_cols_csv} FROM {} ORDER BY {order_col}",
+            quote_ident(table.name)
+        );
+        let mut stmt = src_conn.prepare(&select_sql)?;
+        let mut rows = stmt.query([])?;
+
+        let upsert_sql = build_upsert_sql(table);
+        let mut rows_done: u64 = 0;
+
+        while let Some(row) = rows.next()? {
+            let mut row_map = Map::new();
+            for (col_idx, col) in table.columns.iter().copied().enumerate() {
+                row_map.insert(col.to_string(), sql_value_to_json(row, col_idx)?);
+            }
+
+            if let Some(src_id) = detected_owner {
+                stamp_provenance_for_row(table.name, &mut row_map, src_id);
+            }
+
+            remap_row_for_combine(
+                table.name,
+                &mut row_map,
+                manifest_owner,
+                owner_user_id,
+                &mut conv_id_map,
+                &partner_to_conv_id,
+            );
+
+            let pk_present = row_map.get(table.primary_key).map(|v| !v.is_null()).unwrap_or(false);
+            if !pk_present {
+                continue;
+            }
+
+            let params = table
+                .columns
+                .iter()
+                .copied()
+                .map(|c| json_to_rusqlite(row_map.get(c).unwrap_or(&Value::Null)))
+                .collect::<Result<Vec<_>, AppError>>()?;
+
+            tx.execute(&upsert_sql, rusqlite::params_from_iter(params.iter()))?;
+
+            rows_done += 1;
+            total_rows_imported += 1;
+            if rows_done % PROGRESS_EVERY_N_ROWS == 0 {
+                on_progress(ImportProgress {
+                    table: std::borrow::Cow::Borrowed(table.name),
+                    table_index,
+                    table_count,
+                    rows_done,
+                });
+            }
+        }
+
+        if rows_done > 0 {
+            imported_table_names.push(table.name.to_owned());
+        }
+        on_progress(ImportProgress {
+            table: std::borrow::Cow::Borrowed(table.name),
+            table_index,
+            table_count,
+            rows_done,
+        });
+    }
+
+    let spec_len = table_count - extra_tables.len();
+    for (offset_idx, extra_name) in extra_tables.into_iter().enumerate() {
+        let imported = copy_generic_sqlite_table(
+            &src_conn,
+            &tx,
+            &extra_name,
+            spec_len + offset_idx,
+            table_count,
+            &mut on_progress,
+        )?;
+        if imported > 0 {
+            imported_table_names.push(extra_name);
+            total_rows_imported += imported;
+        }
+    }
+
+    let source_name = source_label
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            src_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sqlite-db")
+                .to_owned()
+        });
+    record_pull_log(
+        &tx,
+        owner_user_id,
+        detected_owner,
+        "sqlite",
+        &source_name,
+        &imported_table_names,
+        total_rows_imported,
+    )?;
+
+    tx.commit()?;
+    Ok(ImportOutcome { ok: true, rows_imported: Some(total_rows_imported), error: None })
+}
+
+fn import_backup_from_path<F>(
+    db_path: &Path,
+    owner_user_id: i64,
+    src_path: &Path,
+    categories: &[String],
+    on_progress: F,
+) -> Result<ImportOutcome, AppError>
+where
+    F: FnMut(ImportProgress<'_>),
+{
+    import_backup_from_path_with_options(
+        db_path,
+        owner_user_id,
+        src_path,
+        categories,
+        None,
+        None,
+        on_progress,
+    )
+}
+
+fn import_backup_from_path_with_options<F>(
+    db_path: &Path,
+    owner_user_id: i64,
+    src_path: &Path,
+    categories: &[String],
+    tables: Option<&[String]>,
+    source_label: Option<&str>,
+    mut on_progress: F,
+) -> Result<ImportOutcome, AppError>
+where
+    F: FnMut(ImportProgress<'_>),
+{
+    if is_sqlite_file(src_path) {
+        return import_sqlite_from_path(
+            db_path,
+            owner_user_id,
+            src_path,
+            categories,
+            tables,
+            source_label,
+            on_progress,
+        );
+    }
+
     let file = File::open(src_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
 
@@ -966,10 +2284,7 @@ where
         ManifestCheck::Valid { manifest_owner, .. } => manifest_owner,
     };
 
-    let selected_tables: Vec<&TableSpec> = EXPORT_TABLES
-        .iter()
-        .filter(|t| categories.iter().any(|c| c == t.category))
-        .collect();
+    let selected_tables = select_tables_for_operation(categories, tables);
 
     let mut conn = Connection::open(db_path)?;
     conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
@@ -985,6 +2300,7 @@ where
 
     let mut total_rows_imported: u64 = 0;
     let table_count = selected_tables.len();
+    let mut imported_table_names: Vec<String> = Vec::new();
 
     for (table_index, table) in selected_tables.into_iter().enumerate() {
         let entry_name = format!("tables/{}.jsonl", table.name);
@@ -1006,6 +2322,8 @@ where
             let Value::Object(mut row_map) = row_value else {
                 continue;
             };
+
+            stamp_provenance_for_row(table.name, &mut row_map, manifest_owner);
 
             remap_row_for_combine(
                 table.name,
@@ -1055,12 +2373,45 @@ where
             rows_done += 1;
             total_rows_imported += 1;
             if rows_done % PROGRESS_EVERY_N_ROWS == 0 {
-                on_progress(ImportProgress { table: table.name, table_index, table_count, rows_done });
+                on_progress(ImportProgress {
+                    table: std::borrow::Cow::Borrowed(table.name),
+                    table_index,
+                    table_count,
+                    rows_done,
+                });
             }
         }
 
-        on_progress(ImportProgress { table: table.name, table_index, table_count, rows_done });
+        if rows_done > 0 {
+            imported_table_names.push(table.name.to_owned());
+        }
+        on_progress(ImportProgress {
+            table: std::borrow::Cow::Borrowed(table.name),
+            table_index,
+            table_count,
+            rows_done,
+        });
     }
+
+    let source_name = source_label
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            src_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("backup.zip")
+                .to_owned()
+        });
+    record_pull_log(
+        &tx,
+        owner_user_id,
+        Some(manifest_owner),
+        "zip",
+        &source_name,
+        &imported_table_names,
+        total_rows_imported,
+    )?;
 
     tx.commit()?;
 
@@ -1074,11 +2425,21 @@ pub fn import_backup_from_file(
     owner_user_id: i64,
     src_path: String,
     categories: Vec<String>,
+    tables: Option<Vec<String>>,
+    source_label: Option<String>,
 ) -> Result<ImportOutcome, AppError> {
     let db_path = resolve_db_path(&app, &db_file_name)?;
-    import_backup_from_path(&db_path, owner_user_id, Path::new(&src_path), &categories, |progress| {
-        let _ = app.emit(IMPORT_PROGRESS_EVENT, progress);
-    })
+    import_backup_from_path_with_options(
+        &db_path,
+        owner_user_id,
+        Path::new(&src_path),
+        &categories,
+        tables.as_deref(),
+        source_label.as_deref(),
+        |progress| {
+            let _ = app.emit(IMPORT_PROGRESS_EVENT, progress);
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1611,5 +2972,150 @@ mod tests {
         assert_eq!(first_seen, 500);
         assert_eq!(last_seen, 1200);
         assert_eq!(history_count, 2);
+    }
+
+    #[test]
+    fn sqlite_export_poll_preview_and_cross_account_combine_with_provenance() {
+        let dir = TestDir::new("sqlite-poll-combine");
+        let src_db = dir.path().join("chat-100.sqlite3");
+        let snap_db = dir.path().join("snapshot.sqlite3");
+        let filtered_db = dir.path().join("filtered.sqlite3");
+        let dst_db = dir.path().join("chat-200.sqlite3");
+
+        let src = Connection::open(&src_db).unwrap();
+        init_backup_test_schema(&src);
+        ensure_optional_directory_tables(&src).unwrap();
+        src.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_local_profile_meta (
+                profile_id TEXT PRIMARY KEY,
+                local_nickname TEXT,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO chat_local_profile_meta (profile_id, local_nickname, updated_at)
+            VALUES ('555', 'Gym Buddy', 1700);
+            INSERT INTO conversations (
+                conversation_id, other_profile_id, name, participants_json,
+                last_activity_timestamp, unread_count, pinned, muted, favorite,
+                preview_json, archived, archived_reason, archived_at, hidden,
+                last_seen_in_inbox_at, created_at, updated_at
+            ) VALUES (
+                '100:555', '555', 'Jordan', '["100","555"]',
+                2000, 0, 0, 0, 1, '{"text":"hey"}', 0, NULL, NULL, 0,
+                NULL, 1000, 2000
+            );
+            INSERT INTO messages (
+                message_id, conversation_id, sender_id, timestamp, type,
+                chat1_type, body_json, unsent, local_history, reply_to_message_id,
+                reply_preview_json, reactions_json, created_at, updated_at
+            ) VALUES (
+                'msg-sqlite-1', '100:555', 100, 2000, 'text',
+                'text', '{"text":"hello from 100"}', 0, 0, NULL,
+                NULL, NULL, 2000, 2000
+            );
+            INSERT INTO known_profiles (profile_id, display_name, primary_image_hash, is_favorite, updated_at)
+            VALUES ('555', 'Jordan', 'hash_jordan', 1, 2000);
+            INSERT INTO profile_snapshots (profile_id, display_name, primary_image_hash, snapshot_json, captured_at)
+            VALUES ('555', 'Jordan', 'hash_jordan', '{"about":"hi"}', 2000);
+            "#,
+        )
+        .unwrap();
+        drop(src);
+
+        // Export clean full SQLite snapshot via VACUUM INTO + provenance stamping
+        export_sqlite_db_to_path(&src_db, 100, &snap_db, None, None).unwrap();
+        assert!(is_sqlite_file(&snap_db));
+
+        // Poll snapshot tables + owner inference
+        let poll = poll_sqlite_at_path(&snap_db).unwrap();
+        assert!(poll.ok);
+        assert_eq!(poll.owner_user_id, Some(100));
+        assert!(poll.tables.iter().any(|t| t.name == "profile_snapshots" && t.row_count == 1));
+        assert!(poll
+            .tables
+            .iter()
+            .any(|t| t.name == "chat_local_profile_meta" && !t.known_export_table && t.row_count == 1));
+
+        // Preview rows from snapshot
+        let preview = preview_sqlite_table_at_path(&snap_db, "known_profiles", 10, 0).unwrap();
+        assert!(preview.ok);
+        assert_eq!(preview.total_rows, 1);
+        assert_eq!(
+            preview.rows[0].get("source_profile_id").and_then(Value::as_str),
+            Some("100")
+        );
+
+        // Export subset-only SQLite DB (only profile_snapshots)
+        let subset = vec!["profile_snapshots".to_owned()];
+        export_sqlite_db_to_path(&src_db, 100, &filtered_db, None, Some(&subset)).unwrap();
+        let filtered_poll = poll_sqlite_at_path(&filtered_db).unwrap();
+        assert_eq!(filtered_poll.tables.len(), 1);
+        assert_eq!(filtered_poll.tables[0].name, "profile_snapshots");
+
+        // Import & combine .sqlite3 snapshot + extra table into account 200 DB
+        let dst = Connection::open(&dst_db).unwrap();
+        init_backup_test_schema(&dst);
+        drop(dst);
+
+        let selected_import = vec![
+            "conversations".to_owned(),
+            "messages".to_owned(),
+            "known_profiles".to_owned(),
+            "profile_snapshots".to_owned(),
+            "chat_local_profile_meta".to_owned(),
+        ];
+        let outcome = import_backup_from_path_with_options(
+            &dst_db,
+            200,
+            &snap_db,
+            &[],
+            Some(&selected_import),
+            Some("chat-100.sqlite3"),
+            |_| {},
+        )
+        .unwrap();
+        assert!(outcome.ok);
+        assert!(outcome.rows_imported.unwrap_or(0) >= 5);
+
+        let verify = Connection::open(&dst_db).unwrap();
+        let (conv_id, conv_src): (String, Option<String>) = verify
+            .query_row(
+                "SELECT conversation_id, source_owner_id FROM conversations WHERE other_profile_id = '555'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let (msg_sender, msg_src): (i64, Option<String>) = verify
+            .query_row(
+                "SELECT sender_id, source_owner_id FROM messages WHERE message_id = 'msg-sqlite-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let known_src: Option<String> = verify
+            .query_row(
+                "SELECT source_profile_id FROM known_profiles WHERE profile_id = '555'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let nick: String = verify
+            .query_row(
+                "SELECT local_nickname FROM chat_local_profile_meta WHERE profile_id = '555'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let log_count: i64 = verify
+            .query_row("SELECT COUNT(*) FROM data_pull_log", [], |r| r.get(0))
+            .unwrap();
+
+        assert_eq!(conv_id, "200:555");
+        assert_eq!(conv_src.as_deref(), Some("100"));
+        assert_eq!(msg_sender, 200);
+        assert_eq!(msg_src.as_deref(), Some("100"));
+        assert_eq!(known_src.as_deref(), Some("100"));
+        assert_eq!(nick, "Gym Buddy");
+        assert_eq!(log_count, 1);
     }
 }

@@ -90,3 +90,15 @@
 
 [2026-11-18 01:26] - Task: Route desktop/iOS backup exports directly through Rust (`exportBackupToFile`), unwrap Tauri error objects/strings in `getErrorMessage`, and log failures via `appLog.error`
 - Modified: `src/pages/app/SettingsDataPage.tsx`
+
+[2026-11-18 01:54] - Task: Coerce AuthContext numeric userId and add DB source provenance schema in chatDb
+- Modified: `src/contexts/AuthContext.tsx`
+- Modified: `src/services/chatDb.ts`
+
+[2026-11-18 01:58] - Task: Add SQLite snapshot export (VACUUM INTO), cross-format inspect/combine, provenance tracking, DB polling, and table row preview in Rust backend
+- Modified: `src-tauri/src/commands/backup.rs`
+- Modified: `src-tauri/src/lib.rs`
+
+[2026-11-18 02:02] - Task: Add numeric ownerId normalization, raw SQLite export, DB polling, local DB browser, and table preview viewer in UI
+- Modified: `src/services/backupRestore.ts`
+- Modified: `src/pages/app/SettingsDataPage.tsx`

@@ -37,6 +37,11 @@ const PUSH_TOKEN_SYNCED_STORAGE_KEY = "fg-fcm-token-synced";
 // so its raw "Error 4: invalid input parameters" text is meaningless to users.
 const INVALID_INPUT_PARAMETERS_CODE = 4;
 
+function parseProfileIdNumber(raw: number | string): number {
+	const parsed = typeof raw === "number" ? raw : Number(raw);
+	return Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
+}
+
 function describeLoginError(
 	appError: AppError | null,
 	fallback: string,
@@ -151,7 +156,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 			const result = await callMethod("login", { email, password });
 			appLog.info("[Auth] login: succeeded");
-			dispatch({ type: "SET_USER", payload: result.profileId });
+			dispatch({ type: "SET_USER", payload: parseProfileIdNumber(result.profileId) });
 			void refreshSavedAccounts();
 			toast.success("Login successful");
 		} catch (error) {
@@ -178,7 +183,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 			const result = await callMethod("login_with_jwt", { token });
 			appLog.info("[Auth] loginWithJwt: succeeded");
-			dispatch({ type: "SET_USER", payload: result.profileId });
+			dispatch({ type: "SET_USER", payload: parseProfileIdNumber(result.profileId) });
 			void refreshSavedAccounts();
 			toast.success("Token login successful");
 		} catch (error) {
@@ -259,7 +264,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 			}
 
 			appLog.info("[Auth] loginWithFacebook: succeeded");
-			dispatch({ type: "SET_USER", payload: result.profileId });
+			dispatch({ type: "SET_USER", payload: parseProfileIdNumber(result.profileId) });
 			void refreshSavedAccounts();
 			toast.success("Facebook login successful");
 		} catch (error) {
@@ -307,7 +312,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 			const result = await callMethod("switch_account", { profileId });
 			appLog.info("[Auth] switchAccount: succeeded");
-			dispatch({ type: "SET_USER", payload: result.profileId });
+			dispatch({ type: "SET_USER", payload: parseProfileIdNumber(result.profileId) });
 			void refreshSavedAccounts();
 			toast.success("Switched account");
 		} catch (error) {

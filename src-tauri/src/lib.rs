@@ -180,8 +180,12 @@ pub fn run() {
                 api::websocket::ws_log_event,
                 commands::fingerprint::check_fingerprint,
                 commands::backup::export_backup_to_file,
+                commands::backup::export_sqlite_db_to_file,
                 commands::backup::import_backup_from_file,
                 commands::backup::inspect_backup_file,
+                commands::backup::poll_database_tables,
+                commands::backup::list_local_databases,
+                commands::backup::preview_table_rows,
             ])
             .build(context)
             .expect("error while running tauri application");
@@ -267,8 +271,12 @@ pub fn run() {
                 api::websocket::ws_log_event,
                 commands::fingerprint::check_fingerprint,
                 commands::backup::export_backup_to_file,
+                commands::backup::export_sqlite_db_to_file,
                 commands::backup::import_backup_from_file,
                 commands::backup::inspect_backup_file,
+                commands::backup::poll_database_tables,
+                commands::backup::list_local_databases,
+                commands::backup::preview_table_rows,
             ])
             .run(context)
             .expect("error while running tauri application");
