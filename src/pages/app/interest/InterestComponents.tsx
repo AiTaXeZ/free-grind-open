@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState, memo, type CSSProperties } from "react";
-import { Eye, Lock, Ban, History, MoveHorizontal, Home, Zap, Check } from "lucide-react";
+import { Eye, Lock, Ban, History, MoveHorizontal, Home, Zap, Check, Camera, Star } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { getThumbImageUrl } from "../../../utils/media";
 import { ProfileImage } from "../../../components/ui/profile-image";
@@ -200,6 +200,23 @@ export const InterestRow = memo(function InterestRow({
 						{isRecovered && (
 							<span title={t("interest_page.recovered_tooltip")}>
 								<History className="h-3 w-3 text-[var(--accent)]" />
+							</span>
+						)}
+						{item.isFavorite && (
+							<span title={t("interest_page.favorite_tooltip", { defaultValue: "Favorite profile" })}>
+								<Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" />
+							</span>
+						)}
+						{(item.photoChangeCount ?? 0) > 1 && (
+							<span
+								title={t("interest_page.photo_changes_tooltip", {
+									defaultValue: "{{count}} tracked profile photos",
+									count: item.photoChangeCount,
+								})}
+								className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)]"
+							>
+								<Camera className="h-2.5 w-2.5" />
+								<span>{item.photoChangeCount}</span>
 							</span>
 						)}
 						{item.rightNow === "HOSTING" && (

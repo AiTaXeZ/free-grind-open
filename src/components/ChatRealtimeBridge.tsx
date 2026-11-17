@@ -32,6 +32,9 @@ import { useApi } from "../hooks/useApi";
 import { ChatRealtimeManager, setActiveRealtimeManager } from "../services/chatRealtime";
 import { TauriWebSocket, isTauriRuntime } from "../services/tauriWebSocket";
 import * as chatLog from "../services/chatLog";
+import * as chatDb from "../services/chatDb";
+import { interestViewsStore } from "../services/interestViewsStore";
+import { fetchAndStoreAvatar } from "../services/avatarStore";
 import {
 	incrementUnreadCountForProfile,
 	clearUnreadCountForProfile,
@@ -705,6 +708,20 @@ export function ChatRealtimeBridge() {
 						shouldProcessIncomingTap(tap.profileId)
 					) {
 						appLog.debug(`[chat-ws:bridge] Incoming tap received from profileId: ${tap.profileId}`);
+						void chatDb
+							.upsertKnownProfiles([
+								{
+									profileId: tap.profileId,
+									displayName: tap.displayName || null,
+									primaryImageHash: tap.imageHash,
+								},
+							])
+							.then(({ favoriteHashesToCache }) => {
+								for (const hash of favoriteHashesToCache) {
+									void fetchAndStoreAvatar(hash);
+								}
+							})
+							.catch(() => {});
 						window.dispatchEvent(
 							new CustomEvent<TapReceivedDetail>(TAP_RECEIVED_EVENT, {
 								detail: tap,
@@ -720,6 +737,31 @@ export function ChatRealtimeBridge() {
 					const view = parseViewPayload(envelope.payload);
 					if (view) {
 						appLog.debug(`[chat-ws:bridge] Incoming view received. Total views: ${view.viewedCount}`);
+						// Persist the exposed profileId + imageHash immediately before
+						// the /v6/views refetch strips profileId from preview items.
+						void Promise.all([
+							interestViewsStore.upsertMany([
+								{
+									profileId: view.profileId,
+									displayName: "",
+									imageHash: view.imageHash,
+									timestamp: view.timestamp,
+									viewCount: 1,
+								},
+							]),
+							chatDb
+								.upsertKnownProfiles([
+									{
+										profileId: view.profileId,
+										primaryImageHash: view.imageHash,
+									},
+								])
+								.then(({ favoriteHashesToCache }) => {
+									for (const hash of favoriteHashesToCache) {
+										void fetchAndStoreAvatar(hash);
+									}
+								}),
+						]).catch(() => {});
 						window.dispatchEvent(
 							new CustomEvent<ViewReceivedDetail>(VIEW_RECEIVED_EVENT, {
 								detail: view,

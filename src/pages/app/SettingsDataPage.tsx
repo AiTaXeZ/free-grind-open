@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	CalendarDays,
+	Database,
 	Download,
 	FileDown,
 	FileUp,
@@ -140,25 +141,29 @@ export function SettingsDataPage() {
 		}
 	};
 
-	const handleExport = async (): Promise<boolean> => {
+	const handleExport = async (
+		overrideCategories?: BackupCategoryId[],
+		filePrefix = "free-grind-data",
+	): Promise<boolean> => {
 		if (userId == null) {
 			toast.error(t("data_backup.export_no_user", { defaultValue: "You must be signed in to export." }));
 			return false;
 		}
-		if (exportCategories.size === 0) {
+		const categoriesToExport = overrideCategories ?? Array.from(exportCategories);
+		if (categoriesToExport.length === 0) {
 			toast.error(t("data_backup.export_no_categories", { defaultValue: "Choose at least one category to export." }));
 			return false;
 		}
 		setIsExporting(true);
 		const tempPath = await newExportTempPath();
 		try {
-			const fileName = `free-grind-data-${new Date().toISOString().slice(0, 10)}.zip`;
+			const fileName = `${filePrefix}-${new Date().toISOString().slice(0, 10)}.zip`;
 
 			// The actual SQL read + base64 decode + zip compression all happen
 			// natively in Rust (src-tauri/src/commands/backup.rs) — this just
 			// writes the archive to a scratch file, which the platform-specific
 			// branches below then move to where the user can actually find it.
-			await exportBackupToFile(chatDb.getActiveChatDbFileName(), userId, tempPath, Array.from(exportCategories));
+			await exportBackupToFile(chatDb.getActiveChatDbFileName(), userId, tempPath, categoriesToExport);
 
 			if (isAndroid()) {
 				// The blob-URL + <a download> trick below doesn't trigger a save on
@@ -622,6 +627,65 @@ export function SettingsDataPage() {
 				</div>
 
 				<div className="grid gap-4">
+					{/* Profile Directory & Photo History DB */}
+					<div>
+						<p className="mb-2 px-1 text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">
+							{t("data_backup.profile_directory_db", { defaultValue: "Profile Directory & Photo History DB" })}
+						</p>
+						<div className="surface-card overflow-hidden divide-y divide-[var(--border)]">
+							<button
+								type="button"
+								onClick={() => void handleExport(["chat_messages", "media_albums"], "free-grind-profile-db")}
+								disabled={isExporting}
+								className={`flex w-full items-center gap-3 px-4 py-3.5 text-left transition-colors ${isExporting ? "opacity-50" : "hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)]"}`}
+							>
+								<div className="shrink-0 rounded-2xl bg-sky-500/15 p-2.5 text-sky-400">
+									<Database className="h-5 w-5" />
+								</div>
+								<div className="min-w-0 flex-1">
+									<p className="text-sm font-semibold leading-snug">
+										{t("data_backup.export_profile_db", { defaultValue: "Export Profile & Photo History DB" })}
+									</p>
+									<p className="mt-0.5 text-xs leading-snug text-[var(--text-muted)]">
+										{t("data_backup.export_profile_db_desc", {
+											defaultValue: "Exports known profile IDs, favorite photo history, avatars, and chat directory into a portable backup.",
+										})}
+									</p>
+								</div>
+								{isExporting ? (
+									<Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--text-muted)]" />
+								) : (
+									<Download className="h-4 w-4 shrink-0 text-[var(--text-muted)] opacity-50" />
+								)}
+							</button>
+							<button
+								type="button"
+								onClick={() => fileInputRef.current?.click()}
+								disabled={isImporting}
+								className={`flex w-full items-center gap-3 px-4 py-3.5 text-left transition-colors ${isImporting ? "opacity-50" : "hover:bg-[var(--surface-2)] active:bg-[var(--surface-2)]"}`}
+							>
+								<div className="shrink-0 rounded-2xl bg-indigo-500/15 p-2.5 text-indigo-400">
+									<FileUp className="h-5 w-5" />
+								</div>
+								<div className="min-w-0 flex-1">
+									<p className="text-sm font-semibold leading-snug">
+										{t("data_backup.import_profile_db", { defaultValue: "Import / Combine DB" })}
+									</p>
+									<p className="mt-0.5 text-xs leading-snug text-[var(--text-muted)]">
+										{t("data_backup.import_profile_db_desc", {
+											defaultValue: "Merge one or more exported DB files into this account to carry over known profiles, photo history, and chats.",
+										})}
+									</p>
+								</div>
+								{isImporting ? (
+									<Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--text-muted)]" />
+								) : (
+									<Upload className="h-4 w-4 shrink-0 text-[var(--text-muted)] opacity-50" />
+								)}
+							</button>
+						</div>
+					</div>
+
 					{/* Media Storage */}
 					<div>
 						<p className="mb-2 px-1 text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">

@@ -507,6 +507,38 @@ async function getDb(): Promise<Database> {
 						updated_at INTEGER NOT NULL
 					)
 				`);
+
+				await db.execute(`
+					CREATE TABLE IF NOT EXISTS known_profiles (
+						profile_id TEXT PRIMARY KEY,
+						display_name TEXT,
+						primary_image_hash TEXT,
+						is_favorite INTEGER NOT NULL DEFAULT 0,
+						updated_at INTEGER NOT NULL
+					)
+				`);
+				await db.execute(
+					"CREATE INDEX IF NOT EXISTS idx_known_profiles_hash ON known_profiles(primary_image_hash)",
+				);
+				await db.execute(
+					"CREATE INDEX IF NOT EXISTS idx_known_profiles_favorite ON known_profiles(is_favorite)",
+				);
+
+				await db.execute(`
+					CREATE TABLE IF NOT EXISTS profile_photo_history (
+						id TEXT PRIMARY KEY,
+						profile_id TEXT NOT NULL,
+						image_hash TEXT NOT NULL,
+						first_seen_at INTEGER NOT NULL,
+						last_seen_at INTEGER NOT NULL
+					)
+				`);
+				await db.execute(
+					"CREATE INDEX IF NOT EXISTS idx_profile_photo_history_profile ON profile_photo_history(profile_id, last_seen_at DESC)",
+				);
+				await db.execute(
+					"CREATE INDEX IF NOT EXISTS idx_profile_photo_history_hash ON profile_photo_history(image_hash)",
+				);
 			});
 
 			return db;
@@ -681,6 +713,13 @@ export async function upsertConversation(
 ): Promise<void> {
 	const db = await getDb();
 	const now = Date.now();
+	const partnerParticipant = otherProfileId
+		? (entry.data.participants ?? []).find((p) => String(p.profileId) === otherProfileId)
+		: undefined;
+	const partnerImageHash =
+		typeof partnerParticipant?.primaryMediaHash === "string" && partnerParticipant.primaryMediaHash.trim()
+			? partnerParticipant.primaryMediaHash.trim()
+			: null;
 
 	await executeWithLockRetry(db, "upsert-conversation", async () => {
 		await db.execute(
@@ -717,6 +756,15 @@ export async function upsertConversation(
 				now,
 			],
 		);
+
+		if (otherProfileId) {
+			await writeKnownProfileTx(db, {
+				profileId: otherProfileId,
+				displayName: entry.data.name || null,
+				primaryImageHash: partnerImageHash,
+				isFavorite: entry.data.favorite ? true : undefined,
+			}, now);
+		}
 	});
 }
 
@@ -2771,4 +2819,400 @@ export async function migrateLegacySettingsIfNeeded(userId: number): Promise<voi
 	} finally {
 		window.localStorage.setItem(LEGACY_SETTINGS_MIGRATED_FLAG, "true");
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Known profiles directory & favorite profile photo history
+// ---------------------------------------------------------------------------
+
+export interface StoredKnownProfile {
+	profileId: string;
+	displayName: string | null;
+	primaryImageHash: string | null;
+	isFavorite: boolean;
+	updatedAt: number;
+}
+
+export interface StoredProfilePhotoHistoryEntry {
+	id: string;
+	profileId: string;
+	imageHash: string;
+	firstSeenAt: number;
+	lastSeenAt: number;
+}
+
+export interface KnownProfileDirectoryEntry extends StoredKnownProfile {
+	photoChangeCount: number;
+}
+
+export interface KnownProfileUpsertInput {
+	profileId: string;
+	displayName?: string | null;
+	primaryImageHash?: string | null;
+	extraImageHashes?: (string | null | undefined)[];
+	isFavorite?: boolean;
+}
+
+type KnownProfileRow = {
+	profile_id: string;
+	display_name: string | null;
+	primary_image_hash: string | null;
+	is_favorite: number;
+	updated_at: number;
+};
+
+type ProfilePhotoHistoryRow = {
+	id: string;
+	profile_id: string;
+	image_hash: string;
+	first_seen_at: number;
+	last_seen_at: number;
+};
+
+function sanitizeProfileId(raw: string | null | undefined): string | null {
+	if (!raw) return null;
+	const trimmed = raw.trim();
+	if (!trimmed || trimmed.startsWith("preview:")) {
+		return null;
+	}
+	return trimmed;
+}
+
+function collectValidImageHashes(entry: KnownProfileUpsertInput): string[] {
+	const seen = new Set<string>();
+	const candidates = [entry.primaryImageHash, ...(entry.extraImageHashes ?? [])];
+	for (const candidate of candidates) {
+		if (typeof candidate === "string") {
+			const trimmed = candidate.trim();
+			if (trimmed.length >= 8 && !trimmed.includes("/") && !trimmed.includes(" ")) {
+				seen.add(trimmed);
+			}
+		}
+	}
+	return Array.from(seen);
+}
+
+async function writeKnownProfileTx(
+	db: Database,
+	entry: KnownProfileUpsertInput,
+	now: number,
+): Promise<string[]> {
+	const profileId = sanitizeProfileId(entry.profileId);
+	if (!profileId) return [];
+
+	const displayName =
+		typeof entry.displayName === "string" && entry.displayName.trim().length > 0
+			? entry.displayName.trim()
+			: null;
+	const primaryImageHash =
+		typeof entry.primaryImageHash === "string" && entry.primaryImageHash.trim().length > 0
+			? entry.primaryImageHash.trim()
+			: null;
+	const isFavNum = entry.isFavorite ? 1 : 0;
+
+	await db.execute(
+		`
+		INSERT INTO known_profiles (
+			profile_id, display_name, primary_image_hash, is_favorite, updated_at
+		) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT(profile_id) DO UPDATE SET
+			display_name = COALESCE(NULLIF(excluded.display_name, ''), known_profiles.display_name),
+			primary_image_hash = COALESCE(NULLIF(excluded.primary_image_hash, ''), known_profiles.primary_image_hash),
+			is_favorite = CASE
+				WHEN excluded.is_favorite = 1 OR known_profiles.is_favorite = 1 THEN 1
+				ELSE 0
+			END,
+			updated_at = excluded.updated_at
+		`,
+		[profileId, displayName, primaryImageHash, isFavNum, now],
+	);
+
+	const hashes = collectValidImageHashes(entry);
+	for (const hash of hashes) {
+		await db.execute(
+			`
+			INSERT INTO profile_photo_history (
+				id, profile_id, image_hash, first_seen_at, last_seen_at
+			) VALUES ($1, $2, $3, $4, $4)
+			ON CONFLICT(id) DO UPDATE SET
+				first_seen_at = MIN(profile_photo_history.first_seen_at, excluded.first_seen_at),
+				last_seen_at = MAX(profile_photo_history.last_seen_at, excluded.last_seen_at)
+			`,
+			[`${profileId}:${hash}`, profileId, hash, now],
+		);
+	}
+
+	return hashes;
+}
+
+export async function upsertKnownProfiles(
+	entries: KnownProfileUpsertInput[],
+): Promise<{ favoriteHashesToCache: string[] }> {
+	if (entries.length === 0) {
+		return { favoriteHashesToCache: [] };
+	}
+
+	const merged = new Map<string, KnownProfileUpsertInput>();
+	for (const entry of entries) {
+		const id = sanitizeProfileId(entry.profileId);
+		if (!id) continue;
+		const existing = merged.get(id);
+		if (!existing) {
+			merged.set(id, { ...entry, profileId: id });
+		} else {
+			merged.set(id, {
+				profileId: id,
+				displayName: entry.displayName?.trim() || existing.displayName,
+				primaryImageHash: entry.primaryImageHash?.trim() || existing.primaryImageHash,
+				extraImageHashes: [
+					...(existing.extraImageHashes ?? []),
+					...(entry.extraImageHashes ?? []),
+				],
+				isFavorite: entry.isFavorite || existing.isFavorite,
+			});
+		}
+	}
+
+	if (merged.size === 0) {
+		return { favoriteHashesToCache: [] };
+	}
+
+	const db = await getDb();
+	const now = Date.now();
+	const hashesByProfile = new Map<string, string[]>();
+
+	await executeWithLockRetry(db, "upsert-known-profiles", async () => {
+		for (const entry of merged.values()) {
+			const hashes = await writeKnownProfileTx(db, entry, now);
+			if (hashes.length > 0) {
+				hashesByProfile.set(entry.profileId, hashes);
+			}
+		}
+	});
+
+	const favoriteHashes = new Set<string>();
+	try {
+		const favRows = await db.select<{ profile_id: string }[]>(
+			`
+			SELECT profile_id FROM known_profiles WHERE is_favorite = 1
+			UNION
+			SELECT other_profile_id AS profile_id FROM conversations WHERE favorite = 1 AND other_profile_id IS NOT NULL
+			`,
+		);
+		const favSet = new Set(favRows.map((r) => r.profile_id));
+		for (const [profileId, hashes] of hashesByProfile) {
+			const entry = merged.get(profileId);
+			if (entry?.isFavorite || favSet.has(profileId)) {
+				for (const hash of hashes) {
+					favoriteHashes.add(hash);
+				}
+			}
+		}
+	} catch (error) {
+		appLog.warn("[chat-db] failed querying favorite hashes for caching", error);
+	}
+
+	return { favoriteHashesToCache: Array.from(favoriteHashes) };
+}
+
+export async function setKnownProfileFavorite(
+	profileId: string,
+	isFavorite: boolean,
+): Promise<void> {
+	const id = sanitizeProfileId(profileId);
+	if (!id) return;
+	const db = await getDb();
+	const now = Date.now();
+	await executeWithLockRetry(db, "set-known-profile-favorite", async () => {
+		await db.execute(
+			`
+			INSERT INTO known_profiles (
+				profile_id, display_name, primary_image_hash, is_favorite, updated_at
+			) VALUES ($1, NULL, NULL, $2, $3)
+			ON CONFLICT(profile_id) DO UPDATE SET
+				is_favorite = excluded.is_favorite,
+				updated_at = excluded.updated_at
+			`,
+			[id, isFavorite ? 1 : 0, now],
+		);
+	});
+}
+
+export async function getProfilePhotoHistory(
+	profileId: string,
+): Promise<StoredProfilePhotoHistoryEntry[]> {
+	const id = sanitizeProfileId(profileId);
+	if (!id) return [];
+	const db = await getDb();
+	const rows = await db.select<ProfilePhotoHistoryRow[]>(
+		`
+		SELECT id, profile_id, image_hash, first_seen_at, last_seen_at
+		FROM profile_photo_history
+		WHERE profile_id = $1
+		ORDER BY last_seen_at DESC, first_seen_at DESC
+		`,
+		[id],
+	);
+	return rows.map((r) => ({
+		id: r.id,
+		profileId: r.profile_id,
+		imageHash: r.image_hash,
+		firstSeenAt: r.first_seen_at,
+		lastSeenAt: r.last_seen_at,
+	}));
+}
+
+export async function getKnownProfileDirectory(): Promise<{
+	byProfileId: Map<string, KnownProfileDirectoryEntry>;
+	byImageHash: Map<string, KnownProfileDirectoryEntry>;
+}> {
+	const db = await getDb();
+	const [knownRows, convRows, historyRows] = await Promise.all([
+		db.select<KnownProfileRow[]>(
+			"SELECT profile_id, display_name, primary_image_hash, is_favorite, updated_at FROM known_profiles",
+		),
+		db.select<
+			{
+				other_profile_id: string | null;
+				name: string | null;
+				participants_json: string;
+				favorite: number;
+				updated_at: number;
+			}[]
+		>(
+			"SELECT other_profile_id, name, participants_json, favorite, updated_at FROM conversations WHERE other_profile_id IS NOT NULL",
+		),
+		db.select<ProfilePhotoHistoryRow[]>(
+			"SELECT id, profile_id, image_hash, first_seen_at, last_seen_at FROM profile_photo_history ORDER BY last_seen_at DESC",
+		),
+	]);
+
+	const hashCountByProfile = new Map<string, Set<string>>();
+	const recordProfileHash = (profileId: string, hash: string | null) => {
+		if (!hash) return;
+		let set = hashCountByProfile.get(profileId);
+		if (!set) {
+			set = new Set();
+			hashCountByProfile.set(profileId, set);
+		}
+		set.add(hash);
+	};
+
+	for (const row of historyRows) {
+		recordProfileHash(row.profile_id, row.image_hash);
+	}
+
+	const byProfileId = new Map<string, KnownProfileDirectoryEntry>();
+	const upsertInMem = (
+		profileId: string,
+		displayName: string | null,
+		primaryImageHash: string | null,
+		isFavorite: boolean,
+		updatedAt: number,
+	) => {
+		const id = sanitizeProfileId(profileId);
+		if (!id) return;
+		const existing = byProfileId.get(id);
+		if (primaryImageHash) {
+			recordProfileHash(id, primaryImageHash);
+		}
+		const count = hashCountByProfile.get(id)?.size ?? 0;
+		if (!existing) {
+			byProfileId.set(id, {
+				profileId: id,
+				displayName: displayName?.trim() || null,
+				primaryImageHash: primaryImageHash?.trim() || null,
+				isFavorite,
+				updatedAt,
+				photoChangeCount: count,
+			});
+			return;
+		}
+		byProfileId.set(id, {
+			profileId: id,
+			displayName: existing.displayName || displayName?.trim() || null,
+			primaryImageHash:
+				updatedAt >= existing.updatedAt
+					? (primaryImageHash?.trim() || existing.primaryImageHash)
+					: (existing.primaryImageHash || primaryImageHash?.trim() || null),
+			isFavorite: existing.isFavorite || isFavorite,
+			updatedAt: Math.max(existing.updatedAt, updatedAt),
+			photoChangeCount: Math.max(existing.photoChangeCount, count),
+		});
+	};
+
+	for (const row of knownRows) {
+		upsertInMem(
+			row.profile_id,
+			row.display_name,
+			row.primary_image_hash,
+			Boolean(row.is_favorite),
+			row.updated_at,
+		);
+	}
+
+	const extraConvHashes: Array<{ profileId: string; hash: string }> = [];
+	for (const conv of convRows) {
+		if (!conv.other_profile_id) continue;
+		let participantHash: string | null = null;
+		try {
+			const participants = JSON.parse(conv.participants_json) as Array<{
+				profileId?: unknown;
+				primaryMediaHash?: unknown;
+			}>;
+			if (Array.isArray(participants)) {
+				const partner = participants.find(
+					(p) => p && String(p.profileId) === conv.other_profile_id,
+				);
+				if (typeof partner?.primaryMediaHash === "string" && partner.primaryMediaHash.trim()) {
+					participantHash = partner.primaryMediaHash.trim();
+				}
+			}
+		} catch {
+			// Ignore invalid JSON.
+		}
+		upsertInMem(
+			conv.other_profile_id,
+			conv.name,
+			participantHash,
+			Boolean(conv.favorite),
+			conv.updated_at,
+		);
+		if (participantHash) {
+			extraConvHashes.push({ profileId: conv.other_profile_id, hash: participantHash });
+		}
+	}
+
+	// Ensure photoChangeCount reflects every entry across both tables.
+	for (const [profileId, entry] of byProfileId) {
+		const count = hashCountByProfile.get(profileId)?.size ?? (entry.primaryImageHash ? 1 : 0);
+		if (count !== entry.photoChangeCount) {
+			byProfileId.set(profileId, { ...entry, photoChangeCount: count });
+		}
+	}
+
+	const byImageHash = new Map<string, KnownProfileDirectoryEntry>();
+	for (const entry of byProfileId.values()) {
+		if (entry.primaryImageHash && !byImageHash.has(entry.primaryImageHash)) {
+			byImageHash.set(entry.primaryImageHash, entry);
+		}
+	}
+	for (const row of historyRows) {
+		if (!byImageHash.has(row.image_hash)) {
+			const entry = byProfileId.get(row.profile_id);
+			if (entry) {
+				byImageHash.set(row.image_hash, entry);
+			}
+		}
+	}
+	for (const { profileId, hash } of extraConvHashes) {
+		if (!byImageHash.has(hash)) {
+			const entry = byProfileId.get(profileId);
+			if (entry) {
+				byImageHash.set(hash, entry);
+			}
+		}
+	}
+
+	return { byProfileId, byImageHash };
 }

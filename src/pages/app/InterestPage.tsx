@@ -1,6 +1,7 @@
-import { RefreshCw, Eye, Flame } from "lucide-react";
+import { RefreshCw, Eye, Flame, Database } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition, type CSSProperties, type TouchEvent } from "react";
 import { useTranslation } from "react-i18next";
+import toast from "react-hot-toast";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useInterestData } from "../../hooks/queries/useInterestQueries";
 import { useBlockedProfileIds } from "../../hooks/queries/useProfileQueries";
@@ -471,6 +472,34 @@ export function InterestPage() {
 		return refetch();
 	}, [activeTab, refetch]);
 
+	const [isScanningDb, setIsScanningDb] = useState(false);
+	const handleScanDbRefresh = useCallback(async () => {
+		if (isScanningDb || isFetching) return;
+		setIsScanningDb(true);
+		try {
+			const res = await handleRefresh();
+			const updatedViews = res.data?.views ?? [];
+			const resolved = updatedViews.filter((v) => !v.profileId.startsWith(PREVIEW_ID_PREFIX)).length;
+			const unresolved = updatedViews.length - resolved;
+			toast.success(
+				unresolved > 0
+					? t("interest_page.scan_db_partial", {
+							defaultValue: "DB scanned: {{resolved}} identified, {{unresolved}} still hidden",
+							resolved,
+							unresolved,
+						})
+					: t("interest_page.scan_db_done", {
+							defaultValue: "DB scanned & refreshed ({{resolved}} views identified)",
+							resolved,
+						}),
+			);
+		} catch {
+			toast.error(t("interest_page.scan_db_failed", { defaultValue: "Failed to scan DB." }));
+		} finally {
+			setIsScanningDb(false);
+		}
+	}, [handleRefresh, isFetching, isScanningDb, t]);
+
 	const handleSetActiveTab = useCallback(
 		(nextTab: InterestTab) => {
 			const nextParams = new URLSearchParams(searchParams);
@@ -581,32 +610,54 @@ export function InterestPage() {
 								onTabClick={handleSetActiveTab}
 							/>
 
-							{activeTab !== "sent" && (
-								<div
-									className="glass-pill flex h-8 shrink-0 items-center gap-1.5 px-3"
-									style={{ "--pill-color": "var(--text-muted)" } as CSSProperties}
-									title={t(activeTab === "views" ? "interest_page.total_viewed_count" : "interest_page.total_taps_count")}
+							<div className="flex shrink-0 items-center gap-2">
+								<button
+									type="button"
+									onClick={() => void handleScanDbRefresh()}
+									disabled={isScanningDb || isFetching}
+									className="glass-pill flex h-8 shrink-0 items-center gap-1.5 px-3 text-xs font-semibold text-[var(--accent)] transition hover:brightness-110 active:scale-95 disabled:opacity-50"
+									style={{ "--pill-color": "var(--accent)" } as CSSProperties}
+									title={t("interest_page.scan_db_tooltip", {
+										defaultValue: "Refresh & scan known profiles DB to identify hidden viewers and favorite photo changes",
+									})}
 								>
-									{activeTab === "views" ? (
-										<Eye className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
+									{isScanningDb || (isFetching && !isQueryLoading) ? (
+										<RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
 									) : (
-										<Flame className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
+										<Database className="h-3.5 w-3.5 shrink-0" />
 									)}
-									<div className="relative flex min-w-[1.25rem] items-center justify-center">
-										<p className={cn(
-											"text-xs font-bold text-[var(--text-muted)] leading-none tabular-nums shrink-0 transition-opacity duration-300",
-											(isFetching && !isQueryLoading) || isDemoLoading ? "opacity-0" : "opacity-100"
-										)}>
-											{activeTab === "views" ? viewedCount : activeItems.length}
-										</p>
-										{((isFetching && !isQueryLoading) || isDemoLoading) && (
-											<div className="absolute inset-0 flex items-center justify-center">
-												<RefreshCw className="h-3 w-3 animate-spin text-[var(--text-muted)]" />
-											</div>
+									<span className="leading-none">
+										{t("interest_page.scan_db", { defaultValue: "Scan DB" })}
+									</span>
+								</button>
+
+								{activeTab !== "sent" && (
+									<div
+										className="glass-pill flex h-8 shrink-0 items-center gap-1.5 px-3"
+										style={{ "--pill-color": "var(--text-muted)" } as CSSProperties}
+										title={t(activeTab === "views" ? "interest_page.total_viewed_count" : "interest_page.total_taps_count")}
+									>
+										{activeTab === "views" ? (
+											<Eye className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
+										) : (
+											<Flame className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
 										)}
+										<div className="relative flex min-w-[1.25rem] items-center justify-center">
+											<p className={cn(
+												"text-xs font-bold text-[var(--text-muted)] leading-none tabular-nums shrink-0 transition-opacity duration-300",
+												(isFetching && !isQueryLoading) || isDemoLoading ? "opacity-0" : "opacity-100"
+											)}>
+												{activeTab === "views" ? viewedCount : activeItems.length}
+											</p>
+											{((isFetching && !isQueryLoading) || isDemoLoading) && (
+												<div className="absolute inset-0 flex items-center justify-center">
+													<RefreshCw className="h-3 w-3 animate-spin text-[var(--text-muted)]" />
+												</div>
+											)}
+										</div>
 									</div>
-								</div>
-							)}
+								)}
+							</div>
 						</div>
 					</div>
 				</div>

@@ -4,6 +4,20 @@ import type {
 } from "../GridPage.types";
 import type { CacheEntry } from "../../../types/grid-cache";
 import { extractMediaHashFromUrl } from "../../../utils/media";
+import * as chatDb from "../../../services/chatDb";
+import { fetchAndStoreAvatar } from "../../../services/avatarStore";
+
+function syncKnownProfilesToDb(entries: chatDb.KnownProfileUpsertInput[]): void {
+	if (entries.length === 0) return;
+	void chatDb
+		.upsertKnownProfiles(entries)
+		.then(({ favoriteHashesToCache }) => {
+			for (const hash of favoriteHashesToCache) {
+				void fetchAndStoreAvatar(hash);
+			}
+		})
+		.catch(() => {});
+}
 
 const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
 const BROWSE_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -54,6 +68,18 @@ export function setCachedProfileDetail(
 	profile: ProfileDetail,
 ) {
 	setInCache(profileCache, profileId, profile, PROFILE_CACHE_TTL_MS);
+	const extraHashes = (profile.medias ?? [])
+		.map((m) => m.mediaHash)
+		.filter((h): h is string => typeof h === "string" && h.trim().length > 0);
+	syncKnownProfilesToDb([
+		{
+			profileId,
+			displayName: profile.displayName ?? null,
+			primaryImageHash: profile.profileImageMediaHash ?? extraHashes[0] ?? null,
+			extraImageHashes: extraHashes,
+			isFavorite: profile.isFavorite === true,
+		},
+	]);
 }
 
 export function getCachedBrowseCards(
@@ -68,6 +94,16 @@ export function setCachedBrowseCards(
 	nextPage: string | null,
 ) {
 	setInCache(browseCache, cacheKey, { cards, nextPage }, BROWSE_CACHE_TTL_MS);
+	syncKnownProfilesToDb(
+		cards.map((card) => ({
+			profileId: card.profileId,
+			displayName: card.displayName ?? null,
+			primaryImageHash: card.primaryImageUrl
+				? extractMediaHashFromUrl(card.primaryImageUrl)
+				: null,
+			isFavorite: card.favorite === true,
+		})),
+	);
 }
 
 /**

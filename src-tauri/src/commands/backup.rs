@@ -239,6 +239,26 @@ const EXPORT_TABLES: &[TableSpec] = &[
         columns: &["id", "tested_at", "test_type", "result", "note", "created_at"],
         blob_columns: &[],
     },
+    TableSpec {
+        name: "known_profiles",
+        primary_key: "profile_id",
+        category: "chat_messages",
+        columns: &[
+            "profile_id",
+            "display_name",
+            "primary_image_hash",
+            "is_favorite",
+            "updated_at",
+        ],
+        blob_columns: &[],
+    },
+    TableSpec {
+        name: "profile_photo_history",
+        primary_key: "id",
+        category: "media_albums",
+        columns: &["id", "profile_id", "image_hash", "first_seen_at", "last_seen_at"],
+        blob_columns: &[],
+    },
 ];
 
 #[derive(Clone, Serialize)]
@@ -420,6 +440,18 @@ fn build_upsert_sql(table: &TableSpec) -> String {
             }
             ("media_files", "fetch_status") => {
                 "fetch_status = CASE WHEN excluded.fetch_status = 'ready' OR media_files.fetch_status != 'ready' THEN excluded.fetch_status ELSE media_files.fetch_status END".to_owned()
+            }
+            ("known_profiles", "display_name" | "primary_image_hash") => {
+                format!("{c} = COALESCE(NULLIF(excluded.{c}, ''), known_profiles.{c})")
+            }
+            ("known_profiles", "is_favorite" | "updated_at") => {
+                format!("{c} = MAX(known_profiles.{c}, excluded.{c})")
+            }
+            ("profile_photo_history", "first_seen_at") => {
+                "first_seen_at = MIN(profile_photo_history.first_seen_at, excluded.first_seen_at)".to_owned()
+            }
+            ("profile_photo_history", "last_seen_at") => {
+                "last_seen_at = MAX(profile_photo_history.last_seen_at, excluded.last_seen_at)".to_owned()
             }
             (_, col) if table.blob_columns.contains(&col) => {
                 format!("{col} = COALESCE(NULLIF(excluded.{col}, ''), {t}.{col})")
@@ -694,6 +726,37 @@ fn load_existing_partner_map(conn: &Connection) -> HashMap<String, String> {
     map
 }
 
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, AppError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table_name],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn ensure_optional_directory_tables(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS known_profiles (
+            profile_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            primary_image_hash TEXT,
+            is_favorite INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS profile_photo_history (
+            id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            image_hash TEXT NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn export_backup_to_path<F>(
     db_path: &Path,
     owner_user_id: i64,
@@ -731,6 +794,11 @@ where
     for (table_index, table) in selected_tables.into_iter().enumerate() {
         let entry_name = format!("tables/{}.jsonl", table.name);
         zip.start_file(&entry_name, text_options)?;
+
+        if !table_exists(&conn, table.name)? {
+            on_progress(ExportProgress { table: table.name, table_index, table_count, rows_done: 0 });
+            continue;
+        }
 
         let select_sql = format!(
             "SELECT {} FROM {} ORDER BY {}",
@@ -863,6 +931,7 @@ where
 
     let mut conn = Connection::open(db_path)?;
     conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    ensure_optional_directory_tables(&conn)?;
     let partner_to_conv_id = if manifest_owner != owner_user_id {
         load_existing_partner_map(&conn)
     } else {
@@ -1135,6 +1204,20 @@ mod tests {
                 note TEXT,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE known_profiles (
+                profile_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                primary_image_hash TEXT,
+                is_favorite INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE profile_photo_history (
+                id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                image_hash TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
             "#,
         )
         .expect("init test schema");
@@ -1404,5 +1487,87 @@ mod tests {
         assert_eq!(pat_conv_exists, 1);
         assert_eq!(album_owner, "200");
         assert_eq!(album_conv, "200:300");
+    }
+
+    #[test]
+    fn combine_merges_known_profiles_and_photo_history() {
+        let dir = TestDir::new("known-profiles");
+        let src_db = dir.path().join("src.db");
+        let dst_db = dir.path().join("dst.db");
+        let zip_path = dir.path().join("profiles.zip");
+
+        let src = Connection::open(&src_db).unwrap();
+        init_backup_test_schema(&src);
+        src.execute(
+            "INSERT INTO known_profiles (profile_id, display_name, primary_image_hash, is_favorite, updated_at) VALUES ('555', 'Jordan', 'hash_new', 1, 2000)",
+            [],
+        )
+        .unwrap();
+        src.execute(
+            "INSERT INTO profile_photo_history (id, profile_id, image_hash, first_seen_at, last_seen_at) VALUES ('555:hash_old', '555', 'hash_old', 500, 1000), ('555:hash_new', '555', 'hash_new', 2000, 2000)",
+            [],
+        )
+        .unwrap();
+
+        export_backup_to_path(
+            &src_db,
+            100,
+            &zip_path,
+            &["chat_messages".to_owned(), "media_albums".to_owned()],
+            |_| {},
+        )
+        .unwrap();
+
+        let dst = Connection::open(&dst_db).unwrap();
+        init_backup_test_schema(&dst);
+        dst.execute(
+            "INSERT INTO known_profiles (profile_id, display_name, primary_image_hash, is_favorite, updated_at) VALUES ('555', NULL, 'hash_old', 0, 1000)",
+            [],
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO profile_photo_history (id, profile_id, image_hash, first_seen_at, last_seen_at) VALUES ('555:hash_old', '555', 'hash_old', 800, 1200)",
+            [],
+        )
+        .unwrap();
+
+        let outcome = import_backup_from_path(
+            &dst_db,
+            200,
+            &zip_path,
+            &["chat_messages".to_owned(), "media_albums".to_owned()],
+            |_| {},
+        )
+        .unwrap();
+        assert!(outcome.ok);
+
+        let (name, hash, is_fav): (Option<String>, Option<String>, i64) = dst
+            .query_row(
+                "SELECT display_name, primary_image_hash, is_favorite FROM known_profiles WHERE profile_id = '555'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let (first_seen, last_seen): (i64, i64) = dst
+            .query_row(
+                "SELECT first_seen_at, last_seen_at FROM profile_photo_history WHERE id = '555:hash_old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let history_count: i64 = dst
+            .query_row(
+                "SELECT COUNT(*) FROM profile_photo_history WHERE profile_id = '555'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(name.as_deref(), Some("Jordan"));
+        assert_eq!(hash.as_deref(), Some("hash_new"));
+        assert_eq!(is_fav, 1);
+        assert_eq!(first_seen, 500);
+        assert_eq!(last_seen, 1200);
+        assert_eq!(history_count, 2);
     }
 }

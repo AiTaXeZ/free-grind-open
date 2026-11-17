@@ -62,3 +62,23 @@
 
 [2026-11-18 00:24] - Task: Add `bun run type-check`, `bun run build`, and `cargo test --lib` to `build-fork.yml` workflow
 - Modified: `.github/workflows/build-fork.yml`
+
+[2026-11-18 00:43] - Task: Fix `createAndroidMediaUri` TS union types in `saveMedia.ts` and ignore pre-existing unused locals during CI `tsc` check
+- Modified: `src/services/saveMedia.ts`
+- Modified: `.github/workflows/build-fork.yml`
+
+[2026-11-18 00:44] - Task: Add `known_profiles` and `profile_photo_history` tables/queries in `chatDb.ts` and backup/combine support + tests in `backup.rs`
+- Modified: `src/services/chatDb.ts`
+- Modified: `src-tauri/src/commands/backup.rs`
+
+[2026-11-18 00:46] - Task: Wire persistent profile & photo history capture from grid cache and realtime WS events, and scan SQLite + `/v3/profiles` during Interest refresh
+- Modified: `src/pages/app/gridpage/cache.ts`
+- Modified: `src/components/ChatRealtimeBridge.tsx`
+- Modified: `src/pages/app/interest/interestUtils.ts`
+- Modified: `src/hooks/queries/useInterestQueries.ts`
+
+[2026-11-18 00:47] - Task: Add Scan DB & Refresh button in `InterestPage`, favorite & photo-change badges in `InterestComponents`, Profile Photo History gallery + viewer in `ProfileDetailsContent`, and Profile Directory DB Export/Import in `SettingsDataPage`
+- Modified: `src/pages/app/InterestPage.tsx`
+- Modified: `src/pages/app/interest/InterestComponents.tsx`
+- Modified: `src/pages/app/gridpage/components/ProfileDetailsContent.tsx`
+- Modified: `src/pages/app/SettingsDataPage.tsx`

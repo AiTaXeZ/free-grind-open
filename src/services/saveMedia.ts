@@ -264,19 +264,32 @@ async function createAndroidMediaUri(
 	mimeType: string,
 	type: "image" | "video",
 ): Promise<AndroidFsUri> {
-	const baseDirs =
-		type === "video"
-			? [AndroidPublicVideoDir.DCIM, AndroidPublicVideoDir.Movies, AndroidPublicGeneralPurposeDir.Download]
-			: [AndroidPublicImageDir.DCIM, AndroidPublicImageDir.Pictures, AndroidPublicGeneralPurposeDir.Download];
-
 	let lastError: unknown;
-	for (const dir of baseDirs) {
-		try {
-			return type === "video"
-				? await AndroidFs.createNewPublicVideoFile(dir, relativePath, mimeType, { isPending: true })
-				: await AndroidFs.createNewPublicImageFile(dir, relativePath, mimeType, { isPending: true });
-		} catch (error) {
-			lastError = error;
+	if (type === "video") {
+		const videoDirs: (AndroidPublicVideoDir | AndroidPublicGeneralPurposeDir)[] = [
+			AndroidPublicVideoDir.DCIM,
+			AndroidPublicVideoDir.Movies,
+			AndroidPublicGeneralPurposeDir.Download,
+		];
+		for (const dir of videoDirs) {
+			try {
+				return await AndroidFs.createNewPublicVideoFile(dir, relativePath, mimeType, { isPending: true });
+			} catch (error) {
+				lastError = error;
+			}
+		}
+	} else {
+		const imageDirs: (AndroidPublicImageDir | AndroidPublicGeneralPurposeDir)[] = [
+			AndroidPublicImageDir.DCIM,
+			AndroidPublicImageDir.Pictures,
+			AndroidPublicGeneralPurposeDir.Download,
+		];
+		for (const dir of imageDirs) {
+			try {
+				return await AndroidFs.createNewPublicImageFile(dir, relativePath, mimeType, { isPending: true });
+			} catch (error) {
+				lastError = error;
+			}
 		}
 	}
 	throw lastError ?? new Error("Failed to create Android public media entry");

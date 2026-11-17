@@ -43,7 +43,9 @@ import {
 } from "../utils";
 import { reverseGeocodeCityDistrictForGeohash } from "../geocoding";
 import { getProfileImageUrl, getThumbImageUrl } from "../../../../utils/media";
-import { resolveAvatarSrc } from "../../../../services/avatarStore";
+import { fetchAndStoreAvatar, resolveAvatarSrc } from "../../../../services/avatarStore";
+import * as chatDb from "../../../../services/chatDb";
+import { PhotoViewer } from "../../../../components/PhotoViewer";
 import { ProfileImage } from "../../../../components/ui/profile-image";
 import { RightNowIcon } from "../../../../components/icons/RightNowIcon";
 import freegrindLogo from "../../../../images/freegrind-logo.webp";
@@ -255,6 +257,65 @@ export function ProfileDetailsContent({
 	const isRightNowHosting = activeProfile.rightNow === "HOSTING";
 
 	const renderPhotoCreatedBadge = (_hash: string) => null;
+
+	const [photoHistory, setPhotoHistory] = useState<chatDb.StoredProfilePhotoHistoryEntry[]>([]);
+	const [historyViewerIndex, setHistoryViewerIndex] = useState<number | null>(null);
+	const prevProfileFavoriteRef = useRef<{ id: string; isFav: boolean | undefined } | null>(null);
+
+	useEffect(() => {
+		const id = String(activeProfile.profileId);
+		const isFav = activeProfile.isFavorite;
+		let cancelled = false;
+
+		const syncAndLoad = async () => {
+			try {
+				if (
+					prevProfileFavoriteRef.current?.id === id &&
+					prevProfileFavoriteRef.current.isFav !== isFav &&
+					typeof isFav === "boolean"
+				) {
+					await chatDb.setKnownProfileFavorite(id, isFav);
+				}
+				prevProfileFavoriteRef.current = { id, isFav };
+
+				const { favoriteHashesToCache } = await chatDb.upsertKnownProfiles([
+					{
+						profileId: id,
+						displayName: activeProfile.displayName ?? null,
+						primaryImageHash:
+							activeProfile.profileImageMediaHash ?? activeProfilePhotoHashes[0] ?? null,
+						extraImageHashes: activeProfilePhotoHashes,
+						isFavorite: isFav ? true : undefined,
+					},
+				]);
+				for (const hash of favoriteHashesToCache) {
+					void fetchAndStoreAvatar(hash, getProfileImageUrl(hash, "1024x1024"));
+				}
+				const history = await chatDb.getProfilePhotoHistory(id);
+				if (!cancelled) {
+					setPhotoHistory(history);
+					if (isFav) {
+						for (const item of history) {
+							void fetchAndStoreAvatar(item.imageHash, getProfileImageUrl(item.imageHash, "1024x1024"));
+						}
+					}
+				}
+			} catch {
+				if (!cancelled) setPhotoHistory([]);
+			}
+		};
+
+		void syncAndLoad();
+		return () => {
+			cancelled = true;
+		};
+	}, [
+		activeProfile.profileId,
+		activeProfile.displayName,
+		activeProfile.profileImageMediaHash,
+		activeProfile.isFavorite,
+		activeProfilePhotoHashes,
+	]);
 
 	const [dragDelta, setDragDelta] = useState(0);
 	const [tapBurst, setTapBurst] = useState<{ key: number; emoji: string } | null>(null);
@@ -920,6 +981,48 @@ export function ProfileDetailsContent({
 			</div>
 			)}
 
+			{(activeProfile.isFavorite || photoHistory.length > 1) && photoHistory.length > 0 && (
+				<div className="px-3">
+					<p className="mb-2 text-xs font-semibold uppercase tracking-[0.1em] text-[var(--text-muted)]">
+						{t("profile_details.photo_history", {
+							defaultValue: "Profile Photo History ({{count}})",
+							count: photoHistory.length,
+						})}
+					</p>
+					<div className="flex gap-2.5 overflow-x-auto pb-1">
+						{photoHistory.map((entry, idx) => {
+							const fallbackThumb = getThumbImageUrl(entry.imageHash, "320x320");
+							const src =
+								resolveAvatarSrc(entry.imageHash, fallbackThumb, {
+									cache: Boolean(activeProfile.isFavorite || isChatLinkedProfile),
+									sourceUrl: getProfileImageUrl(entry.imageHash, "1024x1024"),
+								}) ?? fallbackThumb;
+							return (
+								<button
+									key={entry.id}
+									type="button"
+									onClick={() => setHistoryViewerIndex(idx)}
+									className="group flex w-20 shrink-0 flex-col gap-1 text-left"
+								>
+									<div className="relative h-20 w-20 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-2)]">
+										<ProfileImage src={src} alt={activeProfileName} />
+										{idx === 0 && (
+											<span className="absolute bottom-1 left-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-semibold text-white">
+												{t("profile_details.photo_current", { defaultValue: "Latest" })}
+											</span>
+										)}
+									</div>
+									<span className="truncate text-[10px] text-[var(--text-muted)]">
+										{formatRelativeTime(entry.lastSeenAt) ||
+											new Date(entry.lastSeenAt).toLocaleDateString()}
+									</span>
+								</button>
+							);
+						})}
+					</div>
+				</div>
+			)}
+
 			<div className="px-3">
 				<p className="mb-2 text-xs font-semibold uppercase tracking-[0.1em] text-[var(--text-muted)]">
 					{t("profile_details.account_info")}
@@ -946,6 +1049,26 @@ export function ProfileDetailsContent({
 					</div>
 				</div>
 			</div>
+
+			{historyViewerIndex !== null && (
+				<PhotoViewer
+					isOpen={historyViewerIndex !== null}
+					onClose={() => setHistoryViewerIndex(null)}
+					photos={photoHistory.map((entry) => {
+						const fullUrl = getProfileImageUrl(entry.imageHash, "1024x1024");
+						return {
+							url:
+								resolveAvatarSrc(entry.imageHash, fullUrl, {
+									cache: true,
+									sourceUrl: fullUrl,
+								}) ?? fullUrl,
+							type: "image" as const,
+							alt: activeProfileName,
+						};
+					})}
+					initialIndex={historyViewerIndex}
+				/>
+			)}
 		</div>
 	);
 }
